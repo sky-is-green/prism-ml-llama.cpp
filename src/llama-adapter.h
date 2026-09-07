@@ -72,6 +72,12 @@ struct llama_adapter_lora {
     float alpha;
     bool  rotated_basis = false; // TAARDIS: adapter trained on the block-Hadamard-rotated input
 
+    // TAARDIS: virtual targets. `blk.N.ssm_readout` has no base-model tensor: it is a per-head
+    // low-rank correction on the DeltaNet recurrent READOUT (the tensor between the delta-rule
+    // kernel and the gated RMSNorm), lora_a = B [head_dim, rank, n_heads], lora_b = A [rank,
+    // head_dim, n_heads]. Looked up by name from the graph, not by base tensor.
+    llama_adapter_lora_weight * get_weight_named(const std::string & name);
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
