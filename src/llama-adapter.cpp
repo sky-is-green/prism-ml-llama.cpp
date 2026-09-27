@@ -176,6 +176,29 @@ static const ggml_tensor * taardis_virtual_anchor(const llama_model & model, con
     return nullptr;
 }
 
+// TAARDIS MoE hot-cache sidecar tensors: `blk.N.ffn_*.hot` are raw expert
+// banks; `blk.N.ffn_hot_map` / `ffn_hot_mask` / `ffn_cold_mask` are tiny
+// vectors.  They anchor to the router so they land on the compute device.
+static bool taardis_raw_target(const std::string & name) {
+    return taardis_ends_with(name, ".hot") ||
+           taardis_ends_with(name, ".ffn_hot_map") ||
+           taardis_ends_with(name, ".ffn_hot_mask") ||
+           taardis_ends_with(name, ".ffn_cold_mask");
+}
+
+static const ggml_tensor * taardis_raw_anchor(const llama_model & model, const std::string & name) {
+    // blk.N.<anything> -> blk.N.ffn_gate_inp.weight
+    const size_t p1 = (name.rfind("blk.", 0) == 0) ? name.find('.') : std::string::npos;
+    if (p1 == std::string::npos) {
+        return nullptr;
+    }
+    const size_t p2 = name.find('.', p1 + 1);
+    if (p2 == std::string::npos) {
+        return nullptr;
+    }
+    return model.get_tensor((name.substr(0, p2) + ".ffn_gate_inp.weight").c_str());
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
@@ -302,6 +325,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
     // bundle lora_a and lora_b into pairs
     std::map<std::string, llama_adapter_lora_weight> ab_map;
+    std::map<std::string, ggml_tensor *> extra_map_in;   // TAARDIS hot-cache sidecar
     auto str_endswith = [](const std::string & str, const std::string & suffix) {
         return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
     };
@@ -322,6 +346,8 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             } else {
                 ab_map[name].b = cur;
             }
+        } else if (taardis_raw_target(name)) {
+            extra_map_in[name] = cur;
         } else if (str_endswith(name, "_norm.weight")) {
             // TODO: add support for norm vector
             // for now, we don't really care because most adapters still work fine without it
@@ -430,6 +456,59 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
     }
 
+    // add raw sidecar tensors (hot banks + map/masks), anchored to the router
+    for (auto & it : extra_map_in) {
+        const std::string & name = it.first;
+        ggml_tensor * src = it.second;
+
+        const auto * model_tensor = taardis_raw_anchor(model, name);
+        if (!model_tensor) {
+            throw std::runtime_error("hot-cache tensor '" + name + "' has no anchor (expected blk.N.*)");
+        }
+
+        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        for (auto & ex : buft_extra) {
+            if (ex == buft) {
+                LLAMA_LOG_WARN("%s: hot-cache tensor '%s' cannot use buft '%s', fallback to CPU\n", __func__, name.c_str(), ggml_backend_buft_name(buft));
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+                break;
+            }
+        }
+
+        ggml_context * dev_ctx = ctx_for_buft(buft);
+        if (taardis_ends_with(name, ".hot")) {
+            const std::string base_name = name.substr(0, name.size() - 4) + ".weight";
+            const auto * base = model.get_tensor(base_name.c_str());
+            if (!base) {
+                throw std::runtime_error("hot bank '" + name + "' has no base tensor '" + base_name + "'");
+            }
+            if (ggml_n_dims(src) != 3 || src->ne[0] != base->ne[0] || src->ne[1] != base->ne[1] || src->ne[2] < 1) {
+                throw std::runtime_error("hot bank '" + name + "' shape does not match '" + base_name + "'");
+            }
+            LLAMA_LOG_INFO("%s: hot bank '%s': %lld of %lld experts\n", __func__, name.c_str(), (long long) src->ne[2], (long long) base->ne[2]);
+        } else {
+            const std::string layer = name.substr(0, name.find('.', 4));
+            const auto * bank = model.get_tensor((layer + ".ffn_down_exps.weight").c_str());
+            if (!bank) {
+                bank = model.get_tensor((layer + ".ffn_gate_up_exps.weight").c_str());
+            }
+            if (!bank) {
+                throw std::runtime_error("hot-cache tensor '" + name + "': no expert bank for layer " + layer);
+            }
+            if (ggml_n_dims(src) != 1 || src->ne[0] != bank->ne[2]) {
+                throw std::runtime_error("hot-cache tensor '" + name + "' length does not match the expert count");
+            }
+        }
+
+        ggml_tensor * tensor = ggml_dup_tensor(dev_ctx, src);
+        ggml_set_name(tensor, src->name);
+        adapter.extra_map[name] = tensor;
+    }
+
     // allocate tensors / buffers and zero
     {
         adapter.ctxs.reserve(ctx_map.size());
@@ -467,12 +546,20 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             set_tensor(orig.a, dev.a);
             set_tensor(orig.b, dev.b);
         }
+        for (auto & it : adapter.extra_map) {
+            set_tensor(extra_map_in[it.first], it.second);
+        }
     }
 
     // register adapter with model
     model.loras.insert(&adapter);
 
-    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
+    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2 + adapter.extra_map.size());
+}
+
+ggml_tensor * llama_adapter_lora::get_extra_named(const std::string & name) const {
+    auto it = extra_map.find(name);
+    return it == extra_map.end() ? nullptr : it->second;
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {

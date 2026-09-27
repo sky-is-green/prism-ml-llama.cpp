@@ -78,6 +78,12 @@ struct llama_adapter_lora {
     // head_dim, n_heads]. Looked up by name from the graph, not by base tensor.
     llama_adapter_lora_weight * get_weight_named(const std::string & name);
 
+    // TAARDIS MoE hot-cache sidecar: raw (non-LoRA) tensors -- the hot
+    // expert banks and the small map/mask vectors -- loaded where the router
+    // runs so the graph can pin them on the compute device.
+    std::unordered_map<std::string, ggml_tensor *> extra_map;
+    ggml_tensor * get_extra_named(const std::string & name) const;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
