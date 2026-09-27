@@ -2329,6 +2329,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    // MoE hot-cache sidecar: the split duplicates the expert FFN tail per layer
+    for (const auto & lora : model.loras) {
+        if (!lora->extra_map.empty()) {
+            res += 64u * model.hparams.n_layer();
+            break;
+        }
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {

@@ -183,6 +183,8 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", required=True, help="expert-hits.json")
     ap.add_argument("--hot", type=int, required=True,
                     help="experts to keep per layer (uniform K)")
+    ap.add_argument("--top-k", type=int,
+                    help="expert_used_count to add as dummy slots (default: from the GGUF)")
     ap.add_argument("--out", help="sidecar output path")
     ap.add_argument("--check", action="store_true",
                     help="with --out: verify an existing sidecar against the base")
@@ -192,6 +194,14 @@ def main(argv=None) -> int:
     model_size = model.stat().st_size
     meta, tensors, data_start = read_gguf_index(model)
     arch = meta.get("general.architecture", (0, "?"))[1]
+    n_used = 0
+    for key, (vtype, val) in meta.items():
+        if key.endswith(".expert_used_count"):
+            n_used = int(val)
+    if a.top_k is not None:
+        n_used = a.top_k
+    if n_used <= 0:
+        raise SystemExit("no expert_used_count in the base GGUF; pass --top-k")
     prof = json.loads(Path(a.profile).read_text())
     counts = prof["counts"]                      # [layers][experts]
     n_experts = len(counts[0])
@@ -225,8 +235,14 @@ def main(argv=None) -> int:
             for e in hot:
                 f.seek(data_start + off + e * stride)
                 blob += f.read(stride)
+            # dummy slots: out-of-set selections need distinct ids (the kernel
+            # counts one id per expert per token); their weights are zero, so
+            # the data is never used
+            for _ in range(n_used):
+                f.seek(data_start + off + hot[0] * stride)
+                blob += f.read(stride)
             base = name[: -len(".weight")] + ".hot"
-            out_tensors.append((base, [dims[0], dims[1], len(hot)], ttype))
+            out_tensors.append((base, [dims[0], dims[1], len(hot) + n_used], ttype))
             out_blobs.append(bytes(blob))
             total_hot += len(blob)
             if rel_sizes is None:
@@ -261,7 +277,7 @@ def main(argv=None) -> int:
             base_size = tensor_size(tensors2, name[: -len(".weight")] + ".hot",
                                     ds2, out.stat().st_size)
             hot = hot_by_layer[layer]
-            if base_size != stride * len(hot):
+            if base_size != stride * (len(hot) + n_used):
                 bad += 1
                 continue
             for j in (0, len(hot) - 1):        # spot-check first + last
@@ -275,7 +291,7 @@ def main(argv=None) -> int:
     print(f"tensors     {len(out_tensors)} ({len(banks)} banks + "
           f"{3 * len(counts)} map/masks)")
     print(f"hot bytes   {total_hot / 2**20:.1f} MiB "
-          f"({100 * a.hot / n_experts:.0f}% of experts)")
+          f"({a.hot} hot + {n_used} dummy / {n_experts} experts per layer)")
     print(f"verify      {'OK' if bad == 0 else f'{bad} MISMATCHES'}")
     return 0 if bad == 0 else 1
 

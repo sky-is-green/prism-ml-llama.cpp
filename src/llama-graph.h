@@ -1122,7 +1122,28 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // MoE hot-cache split: the sidecar's hot expert banks plus the tiny
+    // map/mask vectors.  When provided, build_moe_ffn computes the router
+    // selection and the normalized weights once, then runs two masked
+    // mul_mat_id passes (hot bank on its device, cold base bank on CPU) and
+    // adds them; mul_mat_id is linear in the selected experts, so the split is
+    // mathematically identical to the full bank.
+    struct moe_split_t {
+        ggml_tensor * hot_up      = nullptr;
+        ggml_tensor * hot_gate    = nullptr;
+        ggml_tensor * hot_down    = nullptr;
+        ggml_tensor * hot_gate_up = nullptr;   // fused alternative to up/gate
+        ggml_tensor * hot_map     = nullptr;   // I32[n_expert] -> local hot index
+        ggml_tensor * hot_mask    = nullptr;   // F32[n_expert], 1.0 for hot
+        ggml_tensor * cold_mask   = nullptr;   // F32[n_expert], 1.0 for cold
+    };
+
     // build MoE FFN without bias tensors
+    // raw sidecar tensor lookup (MoE hot cache); nullptr when absent
+    ggml_tensor * get_lora_extra(const char * name) const;
+
+    // split != nullptr: run the hot sidecar bank and the cold base bank as two
+    // masked mul_mat_id passes over the same selection/weights (MoE hot cache).
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
@@ -1142,7 +1163,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const moe_split_t * split = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1168,7 +1190,23 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const moe_split_t * split = nullptr) const;
+
+    // one expert-bank pass for the MoE hot-cache split (SILU, no biases, no
+    // per-expert scales); ids/weights are already selection-space values
+    ggml_tensor * build_moe_bank(
+             ggml_tensor * cur_in,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+                    bool   weight_before_ffn,
+                 int64_t   n_embd,
+                 int64_t   n_tokens,
+                     int   il) const;
 
     //
     // inputs

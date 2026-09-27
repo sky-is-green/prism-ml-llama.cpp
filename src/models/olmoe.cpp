@@ -137,6 +137,25 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "ffn_norm", il);
 
         ggml_tensor * moe_in = cur;
+
+        // MoE hot-cache split: when the sidecar provides this layer's hot
+        // banks and map/masks, run the hot/cold passes through the same
+        // selection and weights (mathematically identical output).
+        moe_split_t split;
+        {
+            const std::string base = "blk." + std::to_string(il) + ".";
+            split.hot_up    = get_lora_extra((base + "ffn_up_exps.hot").c_str());
+            split.hot_gate  = get_lora_extra((base + "ffn_gate_exps.hot").c_str());
+            split.hot_down  = get_lora_extra((base + "ffn_down_exps.hot").c_str());
+            split.hot_map   = get_lora_extra((base + "ffn_hot_map").c_str());
+            split.hot_mask  = get_lora_extra((base + "ffn_hot_mask").c_str());
+            split.cold_mask = get_lora_extra((base + "ffn_cold_mask").c_str());
+        }
+        const bool use_split =
+            split.hot_up && split.hot_gate && split.hot_down &&
+            split.hot_map && split.hot_mask && split.cold_mask &&
+            (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
+
         cur = build_moe_ffn(moe_in,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,
@@ -147,7 +166,9 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_FFN_SILU, false,
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                il);
+                il,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                use_split ? &split : nullptr);
         cb(cur, "ffn_moe_out", il);
 
         // optional correction branch on the MoE block output (adapter sidecar)

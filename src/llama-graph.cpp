@@ -1613,6 +1613,16 @@ ggml_tensor * llm_graph_context::build_lora_branch(
     return res;
 }
 
+ggml_tensor * llm_graph_context::get_lora_extra(const char * name) const {
+    for (const auto & lora : *loras) {
+        ggml_tensor * t = lora.first->get_extra_named(name);
+        if (t != nullptr) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -1984,7 +1994,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const moe_split_t * split) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2005,7 +2016,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        split
     );
 }
 
@@ -2033,7 +2045,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const moe_split_t * split) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2172,6 +2185,57 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (split != nullptr) {
+        GGML_ASSERT(selected_experts != nullptr);
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b);
+        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
+        GGML_ASSERT(type_op == LLM_FFN_SILU);
+        GGML_ASSERT(split->hot_down != nullptr && split->hot_map != nullptr &&
+                    split->hot_mask != nullptr && split->cold_mask != nullptr);
+        GGML_ASSERT(split->hot_gate_up != nullptr ||
+                    (split->hot_up != nullptr && split->hot_gate != nullptr));
+
+        const int64_t k = weights->ne[1];
+        const int64_t n = weights->ne[2];
+
+        // per-selected-expert gather of an [n_expert] vector -> [k, n_tokens]
+        auto gather_selected = [&](ggml_tensor * v) -> ggml_tensor * {
+            ggml_tensor * src = ggml_reshape_3d(ctx0, v, 1, v->ne[0], 1);           // [1, n_expert, 1]
+            ggml_tensor * sel = ggml_cont(ctx0, selected_experts);                  // argsort view -> dense
+            ggml_tensor * idx = ggml_reshape_2d(ctx0, sel, k*n, 1);                // [k*n, 1]
+            ggml_tensor * out = ggml_get_rows(ctx0, src, idx);                      // [1, k*n, 1]
+            return ggml_reshape_2d(ctx0, out, k, n);                                // [k, n_tokens]
+        };
+        const int64_t k_hot = split->hot_down->ne[2] - k;   // bank = hot experts + k dummies
+        GGML_ASSERT(k_hot > 0);
+
+        ggml_tensor * local_f = ggml_cast(ctx0, gather_selected(split->hot_map), GGML_TYPE_F32); // [k, n]
+        ggml_tensor * m_hot   = gather_selected(split->hot_mask);                   // [k, n]
+        ggml_tensor * m_cold  = gather_selected(split->cold_mask);                  // [k, n]
+
+        // out-of-set slots map to distinct dummy experts: the kernel counts one
+        // id per expert per token, and their weights are zero anyway
+        ggml_tensor * dummy = ggml_reshape_2d(ctx0,
+                ggml_arange(ctx0, (float) k_hot, (float) (k_hot + k), 1.0f), k, 1);
+        dummy = ggml_repeat_4d(ctx0, dummy, k, n, 1, 1);
+        ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_add(ctx0,
+                ggml_mul(ctx0, local_f, m_hot),
+                ggml_mul(ctx0, dummy, m_cold)), GGML_TYPE_I32);                    // [k, n]
+
+        ggml_tensor * w_hot  = ggml_mul(ctx0, weights, ggml_reshape_3d(ctx0, m_hot,  1, k, n));
+        ggml_tensor * w_cold = ggml_mul(ctx0, weights, ggml_reshape_3d(ctx0, m_cold, 1, k, n));
+
+        ggml_tensor * out_hot = build_moe_bank(
+            cur, split->hot_gate_up, split->hot_up, split->hot_gate, split->hot_down,
+            hot_ids, w_hot, weight_before_ffn, n_embd, n_tokens, il);
+        ggml_tensor * out_cold = build_moe_bank(
+            cur, gate_up_exps, up_exps, gate_exps, down_exps,
+            selected_experts, w_cold, weight_before_ffn, n_embd, n_tokens, il);
+
+        // mul_mat_id is linear in the selected experts: hot + cold == full bank
+        return ggml_add(ctx0, out_hot, out_cold);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2369,6 +2433,74 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cb(moe_out, "ffn_moe_out", il);
 
+    return moe_out;
+}
+
+// one expert-bank pass for the MoE hot-cache split (SILU, no biases, no
+// per-expert scales); ids/weights are already selection-space values
+ggml_tensor * llm_graph_context::build_moe_bank(
+             ggml_tensor * cur_in,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+                    bool   weight_before_ffn,
+                 int64_t   n_embd,
+                 int64_t   n_tokens,
+                     int   il) const {
+    GGML_UNUSED(il);
+    ggml_tensor * cur = ggml_reshape_3d(ctx0, cur_in, n_embd, 1, n_tokens);
+
+    if (weight_before_ffn) {
+        ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, weights->ne[1], n_tokens, 1);
+        cur = ggml_mul(ctx0, repeated, weights);
+    }
+
+    ggml_tensor * up = nullptr;
+    if (gate_up_exps) {
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr);
+        const int64_t n_ff = gate_up->ne[0] / 2;
+        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+    } else {
+        up = build_lora_mm_id(up_exps, cur, selected_experts, nullptr);
+        if (gate_exps) {
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr);
+        } else {
+            cur = up;
+        }
+    }
+
+    if (gate_exps || gate_up_exps) {
+        cur = ggml_swiglu_split(ctx0, cur, up);
+    } else {
+        cur = ggml_silu(ctx0, cur);
+    }
+
+    ggml_tensor * experts = build_lora_mm_id(down_exps, cur, selected_experts, nullptr);
+    if (!weight_before_ffn) {
+        experts = ggml_mul(ctx0, experts, weights);
+    }
+    ggml_build_forward_expand(gf, experts);
+
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+    GGML_ASSERT(hparams.n_expert_used > 0 && hparams.n_expert_used <= LLAMA_MAX_EXPERTS);
+
+    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    ggml_tensor * moe_out = cur_experts[0];
+    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        ggml_build_forward_expand(gf, moe_out);
+    }
+    if (hparams.n_expert_used == 1) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
     return moe_out;
 }
 
