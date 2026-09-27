@@ -152,16 +152,28 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight_named(const std::stri
 }
 
 // TAARDIS virtual LoRA targets: adapter pairs that correct an ACTIVATION rather than a weight.
-// `blk.N.ssm_readout` -> the DeltaNet recurrent readout of layer N. They borrow the device of
-// that layer's ssm_norm so the correction runs where the layer runs.
+// `blk.N.ssm_readout`        -> the DeltaNet recurrent readout of layer N (anchor: ssm_norm)
+// `blk.N.ffn_moe_out.weight` -> the MoE block output of layer N (anchor: ffn_gate_inp)
+// The anchor supplies the device so the correction runs where the layer runs.
+static bool taardis_ends_with(const std::string & s, const std::string & suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 static bool taardis_virtual_target(const std::string & name) {
-    const std::string suffix = ".ssm_readout";
-    return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return taardis_ends_with(name, ".ssm_readout") ||
+           taardis_ends_with(name, ".ffn_moe_out.weight");
 }
 
 static const ggml_tensor * taardis_virtual_anchor(const llama_model & model, const std::string & name) {
-    // blk.N.ssm_readout -> blk.N.ssm_norm.weight
-    return model.get_tensor((name.substr(0, name.size() - std::string("ssm_readout").size()) + "ssm_norm.weight").c_str());
+    if (taardis_ends_with(name, ".ssm_readout")) {
+        // blk.N.ssm_readout -> blk.N.ssm_norm.weight
+        return model.get_tensor((name.substr(0, name.size() - std::string("ssm_readout").size()) + "ssm_norm.weight").c_str());
+    }
+    if (taardis_ends_with(name, ".ffn_moe_out.weight")) {
+        // blk.N.ffn_moe_out.weight -> blk.N.ffn_gate_inp.weight
+        return model.get_tensor((name.substr(0, name.size() - std::string("ffn_moe_out.weight").size()) + "ffn_gate_inp.weight").c_str());
+    }
+    return nullptr;
 }
 
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
@@ -354,6 +366,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
         // device buft and device ctx
         const bool is_virtual = taardis_virtual_target(name);
+        const bool is_moe_corr = taardis_ends_with(name, ".ffn_moe_out.weight");
         const auto * model_tensor = is_virtual ? taardis_virtual_anchor(model, name) : model.get_tensor(name.c_str());
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
@@ -364,7 +377,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
         for (auto & ex : buft_extra) {
             if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, name.c_str(), ggml_backend_buft_name(buft));
 
                 auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 if (!cpu_dev) {
@@ -376,11 +389,19 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             }
         }
 
-        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, name.c_str(), ggml_backend_buft_name(buft));
 
         ggml_context * dev_ctx = ctx_for_buft(buft);
         // validate tensor shape
-        if (is_virtual) {
+        if (is_moe_corr) {
+            const int64_t n_embd = model.hparams.n_embd;
+            if (w.a->ne[0] != n_embd || w.b->ne[1] != n_embd) {
+                throw std::runtime_error("moe correction tensor '" + name + "' has incorrect shape (expected n_embd " + std::to_string(n_embd) + ")");
+            }
+            if (w.a->ne[1] != w.b->ne[0]) {
+                throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
+            }
+        } else if (is_virtual) {
             // readout: a = B [head_dim, rank, n_heads], b = A [rank, head_dim, n_heads]; head_dim == ssm_norm width
             const int64_t hd = model_tensor->ne[0];
             if (w.a->ne[0] != hd || w.b->ne[1] != hd || w.a->ne[1] != w.b->ne[0] || w.a->ne[2] != w.b->ne[2] || w.a->ne[2] < 1) {
