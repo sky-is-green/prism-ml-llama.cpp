@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-moe-slot-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1493,6 +1494,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    moe_cache        (params.moe_cache),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2165,6 +2167,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // FreeToken-style expert slot cache: when this layer's expert banks are cache-managed
+    // and this step's routed experts fit the slot bank, run the expert matmuls against
+    // the GPU slot banks with ids mapped to slots; the map op fetches the misses.
+    ggml_moe_cache_layer * moe_cache_il = (moe_cache != nullptr && il >= 0) ? moe_cache->layer(il) : nullptr;
+    ggml_tensor * moe_ids = selected_experts;
+    if (moe_cache_il != nullptr) {
+        const bool fits  = n_tokens > 0 && n_tokens * n_expert_used <= moe_cache_il->n_slots;
+        // every expert bank this path will read must have a slot bank, and the layer must
+        // not carry scales/biases (the cache does not move them)
+        const bool have_fused    = gate_up_exps != nullptr && moe_cache_il->bank_gu != nullptr;
+        const bool have_separate = gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr &&
+                                   moe_cache_il->bank_gate != nullptr && moe_cache_il->bank_up != nullptr;
+        const bool no_extras = up_exps_s == nullptr && gate_exps_s == nullptr && gate_up_exps_b == nullptr &&
+                               down_exps_s == nullptr && down_exps_b == nullptr;
+        if (fits && no_extras && !weight_before_ffn && (have_fused || have_separate)) {
+            moe_ids = ggml_moe_cache_map(ctx0, selected_experts, moe_cache_il);
+            cb(moe_ids, "ffn_moe_slot_ids", il);
+        } else {
+            moe_cache_il = nullptr;
+        }
+    }
+    const bool moe_cached = moe_cache_il != nullptr;
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2177,7 +2202,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up_w = moe_cached ? moe_cache_il->bank_gu : gate_up_exps;
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_w, cur, moe_ids, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2196,7 +2222,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(moe_cached ? moe_cache_il->bank_up : up_exps, cur, moe_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2209,7 +2235,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(moe_cached ? moe_cache_il->bank_gate : gate_exps, cur, moe_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2310,7 +2336,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(moe_cached ? moe_cache_il->bank_down : down_exps, cur, moe_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);

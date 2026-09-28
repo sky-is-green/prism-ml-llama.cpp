@@ -111,6 +111,7 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.moe_slot_cache          = params.moe_slot_cache;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -461,6 +462,16 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // FreeToken-style MoE expert slot cache: must exist before the reserve graphs
+        // are built so build_moe_ffn can route through the slot banks during warmup too
+        if (cparams.moe_slot_cache > 0) {
+            moe_cache = std::make_unique<llama_moe_slot_cache>();
+            if (moe_cache->init(model, cparams.moe_slot_cache) == 0) {
+                LLAMA_LOG_WARN("%s: --moe-slot-cache requested but no host-placed MoE expert layers found; disabled\n", __func__);
+                moe_cache.reset();
+            }
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -480,6 +491,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (moe_cache && getenv("LLAMA_MOE_SLOT_STATS")) {
+        fprintf(stderr, "%s: %s\n", __func__, moe_cache->stats().c_str());
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -2597,6 +2612,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_cache   =*/ moe_cache.get(),
     };
 }
 
@@ -3752,6 +3768,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.moe_slot_cache              =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

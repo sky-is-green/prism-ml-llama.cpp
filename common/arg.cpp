@@ -2781,6 +2781,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"-msc", "--moe-slot-cache"}, "N",
+        "FreeToken-style expert slot cache: keep up to N hot experts per MoE layer whose\n"
+        "expert banks are host-resident (see -cmoe/-ncmoe/--override-tensor) in VRAM and\n"
+        "fetch the routed experts from the host bank on demand (0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_cache = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_CACHE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

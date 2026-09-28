@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-moe-cache.h"
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1926,6 +1928,89 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// MoE expert slot cache map (FreeToken-style decode residency), see ggml-moe-cache.h.
+//
+// Maps this step's routed expert ids to rows of the layer's GPU slot bank and enqueues
+// the host->device fetches for the misses on the current stream. The op needs a host
+// round trip for the ids (they are small: n_expert_used * n_tokens int32), so any graph
+// containing it must not be CUDA-graph captured.
+static void ggml_cuda_op_moe_cache_map(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[0];
+
+    GGML_ASSERT(ids != nullptr);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(ids) == ggml_nelements(dst));
+
+    ggml_moe_cache_layer * layer = nullptr;
+    memcpy(&layer, dst->op_params, sizeof(layer));
+    GGML_ASSERT(layer != nullptr);
+    GGML_ASSERT(layer->bank_down != nullptr);
+    GGML_ASSERT(layer->bank_gu != nullptr || (layer->bank_gate != nullptr && layer->bank_up != nullptr));
+    GGML_ASSERT((int) layer->slot_for_id.size() == layer->n_expert);
+    GGML_ASSERT((int) layer->id_of_slot.size()  == layer->n_slots);
+    GGML_ASSERT((int) layer->usage.size()       == layer->n_slots);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_ids = ggml_nelements(ids);
+
+    std::vector<int32_t> ids_host(n_ids);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> mapped(n_ids);
+    const int64_t step = ++layer->step;
+
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids_host[i];
+        GGML_ASSERT(e >= 0 && e < layer->n_expert);
+
+        int32_t slot = layer->slot_for_id[e];
+        if (slot < 0) {
+            // evict the least recently used slot (ties -> lowest slot index)
+            slot = 0;
+            for (int32_t s = 1; s < layer->n_slots; ++s) {
+                if (layer->usage[s] < layer->usage[slot]) {
+                    slot = s;
+                }
+            }
+            const int32_t old = layer->id_of_slot[slot];
+            if (old >= 0) {
+                layer->slot_for_id[old] = -1;
+            }
+            layer->id_of_slot[slot] = e;
+            layer->slot_for_id[e]   = slot;
+            layer->usage[slot]      = step;
+
+            const struct bank_copy {
+                const ggml_tensor * dst;
+                const ggml_tensor * src;
+                size_t bytes;
+            } banks[4] = {
+                { layer->bank_gu,   layer->src_gu,   layer->bytes_gu   },
+                { layer->bank_gate, layer->src_gate, layer->bytes_gate },
+                { layer->bank_up,   layer->src_up,   layer->bytes_up   },
+                { layer->bank_down, layer->src_down, layer->bytes_down },
+            };
+            for (const bank_copy & b : banks) {
+                if (b.dst == nullptr) {
+                    continue;
+                }
+                CUDA_CHECK(cudaMemcpyAsync((char *) b.dst->data + (size_t) slot * b.bytes,
+                                           (const char *) b.src->data + (size_t) e * b.bytes,
+                                           b.bytes, cudaMemcpyHostToDevice, stream));
+            }
+            layer->n_fetches += 1;
+        } else {
+            layer->usage[slot] = step;
+            layer->n_hits += 1;
+        }
+        mapped[i] = slot;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, mapped.data(), ggml_nbytes(dst), cudaMemcpyHostToDevice, stream));
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2413,6 +2498,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_CACHE_MAP:
+            ggml_cuda_op_moe_cache_map(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -2600,6 +2688,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        // the MoE slot cache op reads the routed ids to the host and syncs the stream
+        // every step, so a captured graph would replay stale ids
+        if (node->op == GGML_OP_MOE_CACHE_MAP) {
+            use_cuda_graph = false;
         }
 
         if (!use_cuda_graph) {
@@ -5611,6 +5705,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_CACHE_MAP:
+            return op->src[0]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous(op->src[0]) && op->src[0]->ne[0] > 0 && op->src[0]->ne[1] > 0;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

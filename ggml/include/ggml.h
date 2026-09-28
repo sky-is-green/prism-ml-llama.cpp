@@ -586,6 +586,11 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
 
+        // MoE expert slot cache (FreeToken-style): maps routed expert ids to rows of a
+        // GPU-resident slot bank, fetching misses from the host bank and updating the
+        // per-layer LRU. Implemented only by the CUDA/HIP backend (needs the stream).
+        GGML_OP_MOE_CACHE_MAP,
+
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -2711,6 +2716,18 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             float                 scale);
+
+    // MoE expert slot cache map: ids [n_expert_used, n_tokens] (I32, on device) ->
+    //   mapped [n_expert_used, n_tokens] (I32): replacements are slot indices into the
+    //   layer's GPU slot bank. As a side effect the op fetches this step's misses from
+    //   the host bank into the slots on the current stream. `cache_layer` points at a
+    //   ggml_moe_cache_layer (see ggml-moe-cache.h), valid for the context's lifetime.
+    // The op runs on the CUDA/HIP backend only and disables CUDA graph capture for the
+    // graph it belongs to (it needs a host round trip for the ids).
+    GGML_API struct ggml_tensor * ggml_moe_cache_map(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            void                * cache_layer);
 
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
