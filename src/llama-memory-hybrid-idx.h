@@ -12,6 +12,8 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -75,6 +77,19 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias, bool causal_attn) const;
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -123,23 +138,15 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and for the update context, which builds no sparse graph
+    // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool causal_attn) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
@@ -148,7 +155,7 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch or full context
+    // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
