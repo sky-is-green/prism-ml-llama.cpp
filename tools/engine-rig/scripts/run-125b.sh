@@ -8,7 +8,7 @@ TAG=${1:?usage: run-125b.sh <tag> [env ...]}
 shift || true
 
 MODEL=${MODEL:?set MODEL=/path/to/shard-1.gguf}
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 OUT=${OUT:-$REPO/tools/engine-rig/logs}
 LOG=$OUT/server-$TAG.log
 mkdir -p "$OUT"

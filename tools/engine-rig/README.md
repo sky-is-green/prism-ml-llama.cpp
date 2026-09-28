@@ -36,10 +36,12 @@ hipcc -O2 -o hc_test tools/engine-rig/hc_test.cpp -I ggml/include -L build-hip/b
 GGML_LIB_DIR=$PWD/build-hip/bin HIP_VISIBLE_DEVICES=1 ./hc_test
 ```
 
-Must print `ALL PASS`: the fused MoE expert-sum kernel has to be bit-identical to
-the unfused MUL + ADD chain (that is a contract, not a target - it lets us change
-the graph without re-validating logits). The matcher reads the kill switch per
-call, so the same process can do the fused/unfused A/B.
+`hc_test` runs the MoE expert-aggregation subgraph on CPU and GPU and fails on a
+real numerical difference (tolerance). Note that on current upstream this
+subgraph is folded into one kernel (`ggml_cuda_op_moe_weighted_reduction`), and
+the kill switch for fusions (`GGML_CUDA_DISABLE_FUSION`) is read once per
+process - so bit-exact fused-vs-unfused comparisons need two process runs, not
+an in-process A/B.
 
 ## 125B smoke bench (dual-resident)
 
