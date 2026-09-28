@@ -578,6 +578,34 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+// debug: count graph nodes per op when LLAMA_GRAPH_DUMP is set
+static void dump_graph_ops(ggml_cgraph * gf) {
+    int counts[GGML_OP_COUNT] = {0};
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; i++) {
+        counts[ggml_graph_node(gf, i)->op]++;
+    }
+    LLAMA_LOG_INFO("%s: graph ops (n_nodes = %d):\n", __func__, n_nodes);
+    for (int op = 0; op < GGML_OP_COUNT; op++) {
+        if (counts[op] > 0) {
+            LLAMA_LOG_INFO("  %-20s %d\n", ggml_op_name((enum ggml_op) op), counts[op]);
+        }
+    }
+
+    if (getenv("LLAMA_GRAPH_DUMP") && atoi(getenv("LLAMA_GRAPH_DUMP")) > 1) {
+        for (int i = 0; i < n_nodes; i++) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            char src[160] = {0};
+            for (int k = 0; k < GGML_MAX_SRC && t->src[k]; k++) {
+                char one[40];
+                snprintf(one, sizeof(one), "%s%s", k ? "|" : "", ggml_op_name(t->src[k]->op));
+                strncat(src, one, sizeof(src) - strlen(src) - 1);
+            }
+            LLAMA_LOG_INFO("  node %5d %-16s %-24s src: %s\n", i, ggml_op_name(t->op), t->name, src);
+        }
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -657,6 +685,10 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+
+        if (getenv("LLAMA_GRAPH_DUMP")) {
+            dump_graph_ops(gf);
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
