@@ -780,6 +780,31 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    // ROCm/HSA workaround (ternary-serve, 2026-09-27): uploading tensors from many
+    // distinct unpinned host ranges (mmap'd GGUF) makes hipMemcpyAsync stall in
+    // libhsa-runtime64 after a few GiB. Staging large copies through one reusable
+    // pageable buffer keeps the host address constant and avoids the stall.
+    // Repro: qwen125-smoke-20260927/hsa-repro/ (--stage-mb fixes it there too).
+    constexpr size_t stage_size = 64ull * 1024 * 1024; // 64 MiB
+    if (size > stage_size) {
+        static thread_local uint8_t * stage = nullptr;
+        if (stage == nullptr) {
+            stage = (uint8_t *) malloc(stage_size);
+        }
+        if (stage != nullptr) {
+            const uint8_t * src = (const uint8_t *) data;
+            uint8_t * dst = (uint8_t *) tensor->data + offset;
+            for (size_t done = 0; done < size; done += stage_size) {
+                const size_t piece = std::min(stage_size, size - done);
+                memcpy(stage, src + done, piece);
+                CUDA_CHECK(cudaMemcpyAsync(dst + done, stage, piece, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            }
+            return;
+        }
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
