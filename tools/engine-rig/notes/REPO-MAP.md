@@ -29,8 +29,11 @@ verdict in `HANDOFF-EXPERT-CACHE.md`).
   built in `build-hip` (llama-server / llama-perplexity / llama-cli).
 - The taardis clone and the old rig `build-hip` were deleted; the taardis-only
   sidecar commits are preserved here as `archive/taardis-expert-cache`.
-- `~/Desktop/work/ternary-serve/` is retired: only small measurement logs and
-  the handoff docs remain (the rig moved here).
+- `~/Desktop/work/ternary-serve/` is retired: the engine rig, clone and
+  OLMoE GGUFs were deleted; the expert-cache notes were copied here
+  (`EXPERT-CACHE-*.md`, `HANDOFF-EXPERT-CACHE.md`). What remains there is the
+  ternary quant stash (Scion LoRA adapters + release docs) and a clean
+  `beellama.cpp` checkout - not engine work.
 
 ## Naming trap that caused the original mix-up
 
