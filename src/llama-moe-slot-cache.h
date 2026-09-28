@@ -1,9 +1,12 @@
-// MoE expert slot cache (FreeToken-style) — llama-side owner of the per-layer slot banks.
+// Ember — MoE expert residency (llama-side owner of the per-layer slot banks).
+//
+// Independent implementation inspired by FlashML FreeToken's published design; no
+// shared code. See ggml/include/ggml-moe-cache.h and tools/engine-rig/notes/EMBER-20260928.md.
 //
 // Enabled with `--moe-slot-cache N` (context param `moe_slot_cache`). Every MoE layer
 // whose expert banks were placed on the host (e.g. via `-ncmoe` / `--override-tensor`)
 // gets `N` GPU slots per bank; decode graphs route through the slot banks and misses
-// are fetched on demand (ggml_moe_cache_map). See the engine rig notes for the design.
+// are fetched on demand (ggml_moe_cache_map).
 #pragma once
 
 #include "ggml-moe-cache.h"

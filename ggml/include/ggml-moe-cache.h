@@ -1,4 +1,7 @@
-// MoE expert slot cache — shared state for the FreeToken-style expert residency path.
+// Ember — MoE expert residency for llama.cpp on consumer AMD.
+//
+// Independent implementation (part of the Ember project, branch `engine/ember`),
+// inspired by FlashML FreeToken's published design; no shared code.
 //
 // The host bank (the layer's mmap'd/CPU expert tensors) stays where the loader put it;
 // a GPU band of `n_slots` expert rows per bank is the residency target. Every decode
