@@ -2173,19 +2173,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_moe_cache_layer * moe_cache_il = (moe_cache != nullptr && il >= 0) ? moe_cache->layer(il) : nullptr;
     ggml_tensor * moe_ids = selected_experts;
     if (moe_cache_il != nullptr) {
-        const bool fits  = n_tokens > 0 && n_tokens * n_expert_used <= moe_cache_il->n_slots;
-        // every expert bank this path will read must have a slot bank, and the layer must
-        // not carry scales/biases (the cache does not move them)
-        const bool have_fused    = gate_up_exps != nullptr && moe_cache_il->bank_gu != nullptr;
-        const bool have_separate = gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr &&
-                                   moe_cache_il->bank_gate != nullptr && moe_cache_il->bank_up != nullptr;
-        const bool no_extras = up_exps_s == nullptr && gate_exps_s == nullptr && gate_up_exps_b == nullptr &&
-                               down_exps_s == nullptr && down_exps_b == nullptr;
-        if (fits && no_extras && !weight_before_ffn && (have_fused || have_separate)) {
-            moe_ids = ggml_moe_cache_map(ctx0, selected_experts, moe_cache_il);
-            cb(moe_ids, "ffn_moe_slot_ids", il);
+        if (moe_cache_il->identity) {
+            // fully resident: the bank is used directly with the original ids (every
+            // batch size, no map op), so prefill and decode both run on the GPU
         } else {
-            moe_cache_il = nullptr;
+            const bool fits  = n_tokens > 0 && n_tokens * n_expert_used <= moe_cache_il->n_slots;
+            // every expert bank this path will read must have a slot bank, and the layer
+            // must not carry scales/biases (the cache does not move them)
+            const bool have_fused    = gate_up_exps != nullptr && moe_cache_il->bank_gu != nullptr;
+            const bool have_separate = gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr &&
+                                       moe_cache_il->bank_gate != nullptr && moe_cache_il->bank_up != nullptr;
+            const bool no_extras = up_exps_s == nullptr && gate_exps_s == nullptr && gate_up_exps_b == nullptr &&
+                                   down_exps_s == nullptr && down_exps_b == nullptr;
+            if (fits && no_extras && !weight_before_ffn && (have_fused || have_separate)) {
+                moe_ids = ggml_moe_cache_map(ctx0, selected_experts, moe_cache_il);
+                cb(moe_ids, "ffn_moe_slot_ids", il);
+            } else {
+                moe_cache_il = nullptr;
+            }
         }
     }
     const bool moe_cached = moe_cache_il != nullptr;

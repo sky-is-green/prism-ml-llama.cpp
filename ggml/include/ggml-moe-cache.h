@@ -47,6 +47,10 @@ struct ggml_moe_cache_layer {
     std::vector<int64_t> usage;        // [n_slots] last-use step
     int64_t step = 0;
 
+    // true when n_slots >= n_expert: the bank is fully resident at identity slots, so
+    // the graph uses it directly with the original ids (no per-step map op at all)
+    bool identity = false;
+
     // cumulative counters (host side, for stats)
     int64_t n_hits = 0;
     int64_t n_fetches = 0;

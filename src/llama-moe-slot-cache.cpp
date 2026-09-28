@@ -55,6 +55,7 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
         }
 
         // all present expert banks must be host-resident (that is the point of the cache)
+        // and carry real data (a metadata-only probe load, e.g. --fit, has none)
         const ggml_tensor * banks[4] = { gu, gate, up, down };
         bool host = true;
         int64_t n_expert = 0;
@@ -62,7 +63,7 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
             if (t == nullptr) {
                 continue;
             }
-            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) || t->data == nullptr) {
                 host = false;
                 break;
             }
@@ -197,6 +198,7 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
     }
 
     // allocate every device's banks in one buffer, then validate the geometry
+    int n_promoted = 0;
     for (auto & [dev, dev_ls] : dev_layers) {
         ggml_context * ctx = dev_ctx[dev];
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
@@ -235,6 +237,35 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
                 }
                 GGML_ASSERT(bank->nb[2] == bytes);
             }
+
+            // fully covered bank: promote it once and use it directly every step
+            // (identity slots, no per-step map op, graph capture stays enabled)
+            if (lc->n_slots >= lc->n_expert) {
+                for (int32_t e = 0; e < lc->n_expert; ++e) {
+                    lc->slot_for_id[e] = e;
+                    lc->usage[e]       = 0;
+                }
+                for (int32_t s = 0; s < lc->n_expert; ++s) {
+                    lc->id_of_slot[s] = s;
+                }
+
+                const std::pair<ggml_tensor *, const ggml_tensor *> banks[4] = {
+                    { lc->bank_gu,   lc->src_gu   },
+                    { lc->bank_gate, lc->src_gate },
+                    { lc->bank_up,   lc->src_up   },
+                    { lc->bank_down, lc->src_down },
+                };
+                for (const auto & [bank, src] : banks) {
+                    if (bank == nullptr) {
+                        continue;
+                    }
+                    // S can exceed n_expert: copy only the source's rows, never read past it
+                    const size_t bytes = std::min<size_t>(ggml_nbytes(bank), ggml_nbytes(src));
+                    ggml_backend_tensor_set(bank, src->data, 0, bytes);
+                }
+                lc->identity = true;
+                n_promoted += 1;
+            }
         }
     }
 
@@ -245,10 +276,12 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
         total_bytes += ggml_backend_buffer_get_size(b);
     }
 
-    fprintf(stderr, "%s: MoE slot cache: %zu layer(s), %d slots each, %.1f MiB on device(s)\n",
-            __func__, layers.size(), n_slots, (double) total_bytes / (1024.0 * 1024.0));
-    LLAMA_LOG_INFO("%s: MoE slot cache: %zu layer(s), %d slots each, %.1f MiB on device(s)\n",
-                   __func__, layers.size(), n_slots, (double) total_bytes / (1024.0 * 1024.0));
+    fprintf(stderr, "%s: MoE slot cache: %zu layer(s), %d slots each, %.1f MiB on device(s)%s\n",
+            __func__, layers.size(), n_slots, (double) total_bytes / (1024.0 * 1024.0),
+            n_promoted == (int) layers.size() ? " - all fully promoted (identity)" :
+            (n_promoted > 0 ? " - some layers fully promoted (identity)" : ""));
+    LLAMA_LOG_INFO("%s: MoE slot cache: %zu layer(s), %d slots each, %.1f MiB on device(s), %d promoted\n",
+                   __func__, layers.size(), n_slots, (double) total_bytes / (1024.0 * 1024.0), n_promoted);
 
     return (int) layers.size();
 }
