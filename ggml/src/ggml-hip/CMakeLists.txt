@@ -82,6 +82,10 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
 endif()
 
+# the fused MoE expert-sum kernel must round the multiply and each add separately,
+# like the unfused MUL + ADD kernels it replaces; HIP contracts them to FMA otherwise
+set_source_files_properties(../ggml-cuda/mmid.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}

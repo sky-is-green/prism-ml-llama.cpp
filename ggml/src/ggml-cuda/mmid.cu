@@ -178,3 +178,60 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+// Fused expert aggregation for the tail of build_moe_ffn:
+//   dst[i, t] = ((m_0 + m_1) + ... + m_{n_used-1}),  m_e = down[i, e, t] * w[e, t]
+// Replaces the MUL + n_used VIEWs + (n_used - 1) ADDs chain with one kernel.
+// Bit-exact with the unfused chain: the multiply and each add keep their own
+// rounding. mmid.cu is compiled with -ffp-contract=off for HIP because clang
+// would otherwise contract __fmul_rn + __fadd_rn into FMA.
+__launch_bounds__(256, 1)
+static __global__ void moe_expert_sum_fused_f32(
+        const float * __restrict__ down,
+        const float * __restrict__ w,
+        float * __restrict__ dst,
+        const int64_t n_embd,
+        const int64_t n_used,
+        const int64_t n_tokens) {
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (ir >= n_embd * n_tokens) {
+        return;
+    }
+
+    const int64_t i = ir % n_embd;
+    const int64_t t = ir / n_embd;
+
+    const float * down_t = down + i + n_embd * n_used * t;
+    const float * w_t    = w + n_used * t;
+
+    float acc = __fmul_rn(down_t[0], w_t[0]);
+
+    for (int64_t e = 1; e < n_used; ++e) {
+        acc = __fadd_rn(acc, __fmul_rn(down_t[n_embd * e], w_t[e]));
+    }
+
+    dst[ir] = acc;
+}
+
+void ggml_cuda_op_moe_expert_sum_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * mul_node, ggml_tensor * out_node) {
+    const ggml_tensor * down = mul_node->src[0];
+    const ggml_tensor * w    = mul_node->src[1];
+
+    GGML_ASSERT(down->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && out_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(down) && ggml_is_contiguous(w));
+
+    const int64_t n_embd   = mul_node->ne[0];
+    const int64_t n_used   = mul_node->ne[1];
+    const int64_t n_tokens = mul_node->ne[2];
+
+    const int64_t nr = n_embd * n_tokens;
+    const int block_size = 256;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(moe_expert_sum_fused_f32, launch_params,
+            (const float *) down->data, (const float *) w->data, (float *) out_node->data,
+            n_embd, n_used, n_tokens);
+}
