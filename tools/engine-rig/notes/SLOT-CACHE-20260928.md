@@ -4,9 +4,11 @@ First working FreeToken mechanism in the AMD engine: host-placed expert banks ge
 GPU slot band, decode routes through the slots with an LRU ensure + on-demand H2D
 fetch, and the graph is otherwise unchanged. Built on `engine/moe-slot-cache`.
 
-> Measurement note: numbers below are warm (model/page cache hot), 185-token prompt,
-> 64-token greedy. All runs name the model explicitly; an earlier table in this note
-> was accidentally measured on the 35B (a missing env export) and has been redone.
+> Measurement note: tg/pp are from a single completion right after load (185-token
+> prompt, 64-token greedy); decode is steady-state, but pp is cold relative to a warm
+> PLE stream — warm multi-request prefill reaches ~450–530 t/s all-resident on the
+> 125B (harness numbers). All runs name the model explicitly; an earlier table in this
+> note was accidentally measured on the 35B (a missing env export) and has been redone.
 
 ## What landed
 
