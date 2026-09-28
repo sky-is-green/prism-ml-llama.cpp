@@ -2785,12 +2785,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-msc", "--moe-slot-cache"}, "N",
         "FreeToken-style expert slot cache: keep up to N hot experts per MoE layer whose\n"
         "expert banks are host-resident (see -cmoe/-ncmoe/--override-tensor) in VRAM and\n"
-        "fetch the routed experts from the host bank on demand (0 = off)",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        "fetch the routed experts from the host bank on demand (0 = off, 'auto' = fill\n"
+        "each device's free memory after reserving headroom)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_slot_cache = -1;
+                return;
+            }
+            int v = 0;
+            try {
+                v = std::stoi(value);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("invalid value (expected N or 'auto')");
+            }
+            if (v < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_slot_cache = value;
+            params.moe_slot_cache = v;
         }
     ).set_env("LLAMA_ARG_MOE_SLOT_CACHE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

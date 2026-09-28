@@ -20,9 +20,10 @@ llama_moe_slot_cache::~llama_moe_slot_cache() {
 }
 
 int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
-    if (n_slots <= 0) {
+    if (n_slots == 0) {
         return 0;
     }
+    const bool auto_slots = n_slots < 0;
 
     struct candidate {
         int il;
@@ -83,6 +84,46 @@ int llama_moe_slot_cache::init(const llama_model & model, int n_slots) {
 
     if (candidates.empty()) {
         return 0;
+    }
+
+    // per-(layer, slot) bytes across all banks (layers can differ; take the largest)
+    size_t bytes_per_slot = 0;
+    std::map<ggml_backend_dev_t, int> layers_per_dev;
+    int max_expert = 0;
+    for (const candidate & c : candidates) {
+        size_t b = c.down->nb[2];
+        if (c.gu)   b += c.gu->nb[2];
+        if (c.gate) b += c.gate->nb[2];
+        if (c.up)   b += c.up->nb[2];
+        bytes_per_slot = std::max(bytes_per_slot, b);
+        layers_per_dev[c.dev] += 1;
+        max_expert = std::max(max_expert, (int) c.down->ne[2]);
+    }
+
+    // --moe-slot-cache auto: fill each device's free memory, keeping a reserve for the
+    // compute buffers/KV headroom that the scheduler reserves after this point. Mirrors
+    // FreeToken's --moe-cache-auto (net budget = free - reserve, greedy into expert slots).
+    if (auto_slots) {
+        n_slots = max_expert;
+        for (const auto & [dev, n_layers] : layers_per_dev) {
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(dev, &props);
+            const size_t free_bytes = props.memory_free;
+            const size_t reserve = std::max<size_t>((size_t) 512 << 20, free_bytes / 5);
+            if (free_bytes <= reserve) {
+                n_slots = 0;
+                break;
+            }
+            const size_t per_slot_dev = bytes_per_slot * (size_t) n_layers;
+            const size_t slots_dev = (free_bytes - reserve) / std::max<size_t>(per_slot_dev, 1);
+            n_slots = std::min(n_slots, (int) std::min<size_t>(slots_dev, (size_t) max_expert));
+        }
+        if (n_slots <= 0) {
+            LLAMA_LOG_WARN("%s: --moe-slot-cache auto found no free VRAM for a slot bank; disabled\n", __func__);
+            return 0;
+        }
+        LLAMA_LOG_INFO("%s: --moe-slot-cache auto -> %d slots per layer (%.1f MiB per slot across %zu layers)\n",
+                       __func__, n_slots, (double) bytes_per_slot / (1024.0 * 1024.0), candidates.size());
     }
 
     // one context + one backend buffer per device, created up front so a single

@@ -464,7 +464,7 @@ llama_context::llama_context(
 
         // FreeToken-style MoE expert slot cache: must exist before the reserve graphs
         // are built so build_moe_ffn can route through the slot banks during warmup too
-        if (cparams.moe_slot_cache > 0) {
+        if (cparams.moe_slot_cache != 0) {
             moe_cache = std::make_unique<llama_moe_slot_cache>();
             if (moe_cache->init(model, cparams.moe_slot_cache) == 0) {
                 LLAMA_LOG_WARN("%s: --moe-slot-cache requested but no host-placed MoE expert layers found; disabled\n", __func__);
