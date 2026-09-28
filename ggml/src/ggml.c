@@ -1125,6 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "DSV41_FAKE_QUANT",
     "DSV41_HC_MIXES",
+    "MOE_CACHE_MAP",
 
     "UNARY",
 
@@ -1142,7 +1143,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1242,6 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv41_fake_quant(x)",
     "dsv41_hc_mixes(mixes, scale, base)",
+    "moe_cache_map(ids)",
 
     "unary(x)",
 
@@ -1259,7 +1261,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6620,6 +6622,29 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
     result->op     = GGML_OP_DSV4_HC_PRE;
     result->src[0] = x;
     result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_moe_cache_map
+
+struct ggml_tensor * ggml_moe_cache_map(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        void                * cache_layer) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    // the router's top-k output can be a strided view; the op reads it as a flat array
+    if (!ggml_is_contiguous(ids)) {
+        ids = ggml_cont(ctx, ids);
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, ids);
+
+    ggml_set_op_params(result, &cache_layer, sizeof(cache_layer));
+
+    result->op     = GGML_OP_MOE_CACHE_MAP;
+    result->src[0] = ids;
 
     return result;
 }

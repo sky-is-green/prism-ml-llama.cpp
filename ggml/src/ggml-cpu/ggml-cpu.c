@@ -2124,6 +2124,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv41_hc_mixes(params, tensor);
             } break;
+        case GGML_OP_MOE_CACHE_MAP:
+            {
+                // device-only op: it must run on the same backend as the expert banks,
+                // because it moves host rows into the GPU slot bank on the device stream
+                GGML_ABORT("GGML_OP_MOE_CACHE_MAP is only implemented by the CUDA/HIP backend");
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2315,6 +2321,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
+        case GGML_OP_MOE_CACHE_MAP:
             {
                 n_tasks = 1;
             } break;

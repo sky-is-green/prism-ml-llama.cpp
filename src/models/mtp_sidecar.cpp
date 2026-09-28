@@ -60,6 +60,7 @@ std::unique_ptr<llm_graph_context> llama_model_mtp_sidecar::build_arch_graph(con
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
         case LLM_GRAPH_TYPE_DECODER_MTP:   // the draft-mtp lane's context
+        case LLM_GRAPH_TYPE_ENCODER:       // a memory-less context routes llama_decode -> encode
             return std::make_unique<graph>(*this, params);
         default:
             GGML_ABORT("invalid graph type for the mtp sidecar");

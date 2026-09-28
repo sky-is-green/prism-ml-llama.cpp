@@ -476,6 +476,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_MOE_CACHE_MAP:
+            // device-only: it moves rows into a GPU slot bank on the device stream
+            return false;
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
         default:

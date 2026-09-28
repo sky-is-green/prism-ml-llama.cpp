@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-slot-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -326,6 +327,9 @@ private:
     // see llama_dspark_ctx in llama-graph.h for why this needs its own side channel
     // instead of riding batch.token/embd.
     llama_dspark_ctx dspark_ctx;
+
+    // FreeToken-style expert slot cache (host-placed MoE expert banks -> GPU slots)
+    std::unique_ptr<llama_moe_slot_cache> moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -119,6 +119,8 @@ struct llama_dspark_ctx {
 };
 struct llm_graph_params;
 
+class llama_moe_slot_cache;
+
 //
 // llm_graph_input
 //
@@ -889,6 +891,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // FreeToken-style expert slot cache owner (null when the feature is off)
+    llama_moe_slot_cache * moe_cache = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1143,6 +1148,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // FreeToken-style expert slot cache (owned by llama_context; null when off)
+    llama_moe_slot_cache * moe_cache;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
