@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -3463,6 +3464,30 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ggml_cuda_check_fusion_memory_ranges skips tensors with GGML_OP_NONE (leaves),
+// but the scheduler can reuse an input buffer for a later output. The fused MoE
+// expert-sum kernel reads its two inputs while writing the output, so any alias
+// between the output and either input is a race.
+static bool ggml_cuda_moe_sum_input_alias(const ggml_tensor * out, const ggml_tensor * mul) {
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const int64_t a_start = (int64_t) a->data;
+        const int64_t a_end   = a_start + (int64_t) ggml_nbytes(a);
+        const int64_t b_start = (int64_t) b->data;
+        const int64_t b_end   = b_start + (int64_t) ggml_nbytes(b);
+
+        return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
+    };
+
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = mul->src[s];
+        if (src && overlap(out, src)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4218,6 +4243,82 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // MoE expert aggregation tail of build_moe_ffn:
+    //   experts = down*w; out = ((v_0 + v_1) + v_2) + ... over the n_used VIEW slices
+    // Replaced by a single kernel; the mul and the adds keep their own rounding and
+    // order, so the result is bit-identical to the unfused chain.
+    if (getenv("GGML_CUDA_NO_MOE_SUM_FUSE") == nullptr && node->op == GGML_OP_MUL) {
+        const ggml_tensor * mul  = node;
+        const ggml_tensor * down = mul->src[0];
+        const ggml_tensor * w    = mul->src[1];
+
+        if (down && w &&
+            mul->type == GGML_TYPE_F32 && down->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(mul) && ggml_is_contiguous(down) && ggml_is_contiguous(w) &&
+            down->ne[0] == mul->ne[0] && down->ne[1] == mul->ne[1] && down->ne[2] == mul->ne[2] &&
+            w->ne[0] == 1 && w->ne[1] == mul->ne[1] && w->ne[2] == mul->ne[2] &&
+            mul->ne[3] == 1 && down->ne[3] == 1 && w->ne[3] == 1 &&
+            mul->ne[1] >= 2 && mul->ne[1] <= 15) {
+
+            const int n_used = (int) mul->ne[1];
+            const int count  = 1 + n_used + (n_used - 1);
+
+            enum ggml_op ops[32];
+            int          n_ops = 0;
+            ops[n_ops++] = GGML_OP_MUL;
+            for (int k = 0; k < n_used; ++k) {
+                ops[n_ops++] = GGML_OP_VIEW;
+            }
+            for (int k = 0; k < n_used - 1; ++k) {
+                ops[n_ops++] = GGML_OP_ADD;
+            }
+            GGML_ASSERT(n_ops == count);
+
+            const int out_node_idx = i + count - 1;
+            const int outputs[1]   = { out_node_idx };
+
+            if (ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, 1)) {
+                // the views must be exactly the per-expert slices of the product, in order
+                bool ok = true;
+                for (int k = 0; k < n_used && ok; ++k) {
+                    const ggml_tensor * v = cgraph->nodes[i + 1 + k];
+                    ok = v->view_src == mul && v->view_offs == (size_t) k * mul->nb[1] &&
+                         v->nb[0] == sizeof(float) && v->nb[1] == mul->nb[2] &&
+                         v->ne[0] == mul->ne[0] && v->ne[1] == mul->ne[2] &&
+                         v->ne[2] == 1 && v->ne[3] == 1;
+                }
+
+                // first ADD takes views 0 and 1; each next one folds in the next view
+                for (int k = 0; k < n_used - 1 && ok; ++k) {
+                    const ggml_tensor * add = cgraph->nodes[i + 1 + n_used + k];
+                    const ggml_tensor * lhs = k == 0 ? cgraph->nodes[i + 1] : cgraph->nodes[i + n_used + k];
+                    const ggml_tensor * rhs = cgraph->nodes[i + 2 + k];
+                    ok = add->src[0] == lhs && add->src[1] == rhs &&
+                         add->ne[0] == mul->ne[0] && add->ne[1] == mul->ne[2] &&
+                         add->ne[2] == 1 && add->ne[3] == 1;
+                }
+
+                const ggml_tensor * out = cgraph->nodes[out_node_idx];
+                ok = ok && out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && out->ne[2] == 1 && out->ne[3] == 1;
+
+                const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, outputs, 1) &&
+                                    !ggml_cuda_moe_sum_input_alias(out, mul);
+                if (ok && mem_ok) {
+                    ggml_cuda_op_moe_expert_sum_fused(*cuda_ctx, mul, cgraph->nodes[out_node_idx]);
+                    static bool fuse_log = getenv("GGML_CUDA_FUSION_LOG") != nullptr;
+                    if (fuse_log) {
+                        static int n_logged = 0;
+                        if (n_logged++ < 300) {
+                            fprintf(stderr, "[fusion] moe_expert_sum fired (n_embd=%d, n_used=%d, nt=%d)\n",
+                                    (int) mul->ne[0], n_used, (int) mul->ne[2]);
+                        }
+                    }
+                    return count - 1;
+                }
+            }
+        }
     }
 
     return 0;
