@@ -23,11 +23,14 @@ The shelved expert-cache sidecar commits exist only there (push from this accoun
 is denied; they are preserved in the local clone and superseded by the shelved
 verdict in `HANDOFF-EXPERT-CACHE.md`).
 
-## Scratch (to retire once the prism rig is validated)
+## Local layout (2026-09-28)
 
-`~/Desktop/work/ternary-serve/` - the original rig directory: logs, the old
-`build-hip`, the taardis clone. The rig itself now lives in this repo under
-`tools/engine-rig/`.
+- Engine clone: `~/Desktop/work/prism-ml-llama.cpp`, branch `engine/amd-rig`,
+  built in `build-hip` (llama-server / llama-perplexity / llama-cli).
+- The taardis clone and the old rig `build-hip` were deleted; the taardis-only
+  sidecar commits are preserved here as `archive/taardis-expert-cache`.
+- `~/Desktop/work/ternary-serve/` is retired: only small measurement logs and
+  the handoff docs remain (the rig moved here).
 
 ## Naming trap that caused the original mix-up
 
