@@ -29,7 +29,6 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
->>>>>>> 6c84c7d5d
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -265,7 +264,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<int32_t> i_batch_end;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq) :
-        common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq),
+        common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq, params.draft.n_max),
         params(params.draft) {
         auto * ctx_dft = this->params.ctx_dft;
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -2554,7 +2553,7 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
     std::vector<std::vector<float>> last_h;
 
     common_speculative_impl_draft_mtp_sidecar(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR, n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR, n_seq, params.draft.n_max)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
