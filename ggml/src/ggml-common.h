@@ -1173,6 +1173,13 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
+// Q3X32 codebook: 8 levels trained on the release PLE table (see the Scion
+// note PLE-TABLE-TYPES.md). The 3-bit code is the index into this table.
+GGML_TABLE_BEGIN(float, kQ3x32_levels, 8)
+    -5.17308617f, -3.14964318f, -1.84705281f, -0.830217063f,
+     0.371574461f, 1.65762842f, 3.0041852f, 5.05979347f,
+GGML_TABLE_END()
+
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)

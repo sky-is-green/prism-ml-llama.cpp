@@ -49,13 +49,18 @@ static void ref_decode_row(enum ggml_type type, const uint8_t * row, float * out
             break;
         case GGML_TYPE_Q3X32:
             for (int64_t b = 0; b < n/32; b++) {
+                // codebook levels must match kQ3x32_levels in the fork's ggml
+                static const float levels[8] = {
+                    -5.17308617f, -3.14964318f, -1.84705281f, -0.830217063f,
+                     0.371574461f, 1.65762842f, 3.0041852f, 5.05979347f,
+                };
                 const uint8_t * blk = row + b*14;
                 const float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *) blk);
                 const uint8_t * qs = blk + 2;
                 const uint8_t * qh = blk + 10;
                 for (int j = 0; j < 32; j++) {
                     const int c = ((qs[j/4] >> ((j % 4)*2)) & 3) | (((qh[j/8] >> (j % 8)) & 1) << 2);
-                    out[b*32 + j] = (2*c - 7) * d;
+                    out[b*32 + j] = levels[c] * d;
                 }
             }
             break;

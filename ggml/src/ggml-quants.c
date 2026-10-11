@@ -2408,22 +2408,46 @@ void quantize_row_q3x32_ref(const float * GGML_RESTRICT x, block_q3x32 * GGML_RE
     const int64_t nb = k / QK3X32;
 
     for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK3X32;
+
         float amax = 0.0f;
         for (int j = 0; j < QK3X32; j++) {
-            amax = MAX(amax, fabsf(x[i*QK3X32 + j]));
+            amax = MAX(amax, fabsf(xb[j]));
         }
 
-        const float d  = amax / 7.0f;
-        const float id = d ? 1.0f/d : 0.0f;
+        // least-squares scale for the fixed codebook: alternate nearest-level
+        // assignment and s = sum(x*lv)/sum(lv*lv), then round s to fp16
+        float s = amax / kQ3x32_levels[7];
+        for (int it = 0; it < 3; it++) {
+            float num = 0.0f;
+            float den = 0.0f;
+            for (int j = 0; j < QK3X32; j++) {
+                float best = fabsf(xb[j] - s*kQ3x32_levels[0]);
+                int bc = 0;
+                for (int l = 1; l < 8; l++) {
+                    const float dist = fabsf(xb[j] - s*kQ3x32_levels[l]);
+                    if (dist < best) { best = dist; bc = l; }
+                }
+                num += xb[j]*kQ3x32_levels[bc];
+                den += kQ3x32_levels[bc]*kQ3x32_levels[bc];
+            }
+            s = den > 0.0f ? num/den : 0.0f;
+        }
 
-        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].d = GGML_FP32_TO_FP16(s);
+        const float sd = GGML_FP16_TO_FP32(y[i].d);
+
         memset(y[i].qs, 0, sizeof(y[i].qs));
         memset(y[i].qh, 0, sizeof(y[i].qh));
-
         for (int j = 0; j < QK3X32; j++) {
-            const int c = MIN(MAX((int) roundf((x[i*QK3X32 + j]*id + 7.0f) * 0.5f), 0), 7);
-            y[i].qs[j/4] |= (uint8_t) (c & 3) << ((j % 4)*2);
-            y[i].qh[j/8] |= (uint8_t) (c >> 2) << (j % 8);
+            float best = fabsf(xb[j] - sd*kQ3x32_levels[0]);
+            int bc = 0;
+            for (int l = 1; l < 8; l++) {
+                const float dist = fabsf(xb[j] - sd*kQ3x32_levels[l]);
+                if (dist < best) { best = dist; bc = l; }
+            }
+            y[i].qs[j/4] |= (uint8_t) (bc & 3) << ((j % 4)*2);
+            y[i].qh[j/8] |= (uint8_t) (bc >> 2) << (j % 8);
         }
     }
 }
@@ -2437,7 +2461,7 @@ void dequantize_row_q3x32(const block_q3x32 * GGML_RESTRICT x, float * GGML_REST
 
         for (int j = 0; j < QK3X32; j++) {
             const int c = (x[i].qs[j/4] >> ((j % 4)*2) & 3) | ((x[i].qh[j/8] >> (j % 8) & 1) << 2);
-            y[i*QK3X32 + j] = (2*c - 7) * d;
+            y[i*QK3X32 + j] = kQ3x32_levels[c] * d;
         }
     }
 }
@@ -2457,22 +2481,46 @@ size_t quantize_q3x32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 void quantize_row_q2x32_ref(const float * GGML_RESTRICT x, block_q2x32 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK2X32 == 0);
     const int64_t nb = k / QK2X32;
+    static const float levels[4] = {-3.0f, -1.0f, 1.0f, 3.0f};
 
     for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK2X32;
+
         float amax = 0.0f;
         for (int j = 0; j < QK2X32; j++) {
-            amax = MAX(amax, fabsf(x[i*QK2X32 + j]));
+            amax = MAX(amax, fabsf(xb[j]));
         }
 
-        const float d  = amax / 3.0f;
-        const float id = d ? 1.0f/d : 0.0f;
+        // same least-squares scale as Q3X32, mid-rise level set
+        float s = amax / 3.0f;
+        for (int it = 0; it < 3; it++) {
+            float num = 0.0f;
+            float den = 0.0f;
+            for (int j = 0; j < QK2X32; j++) {
+                float best = fabsf(xb[j] - s*levels[0]);
+                int bc = 0;
+                for (int l = 1; l < 4; l++) {
+                    const float dist = fabsf(xb[j] - s*levels[l]);
+                    if (dist < best) { best = dist; bc = l; }
+                }
+                num += xb[j]*levels[bc];
+                den += levels[bc]*levels[bc];
+            }
+            s = den > 0.0f ? num/den : 0.0f;
+        }
 
-        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].d = GGML_FP32_TO_FP16(s);
+        const float sd = GGML_FP16_TO_FP32(y[i].d);
+
         memset(y[i].qs, 0, sizeof(y[i].qs));
-
         for (int j = 0; j < QK2X32; j++) {
-            const int c = MIN(MAX((int) roundf((x[i*QK2X32 + j]*id + 3.0f) * 0.5f), 0), 3);
-            y[i].qs[j/4] |= (uint8_t) c << ((j % 4)*2);
+            float best = fabsf(xb[j] - sd*levels[0]);
+            int bc = 0;
+            for (int l = 1; l < 4; l++) {
+                const float dist = fabsf(xb[j] - sd*levels[l]);
+                if (dist < best) { best = dist; bc = l; }
+            }
+            y[i].qs[j/4] |= (uint8_t) bc << ((j % 4)*2);
         }
     }
 }

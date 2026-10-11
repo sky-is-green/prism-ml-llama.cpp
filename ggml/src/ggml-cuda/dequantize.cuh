@@ -80,8 +80,8 @@ static __device__ __forceinline__ void dequantize_q3x32(const void * vx, const i
     const int c0 = (x[ib].qs[iqs/4] >> ((iqs % 4)*2) & 3) | ((x[ib].qh[iqs/8] >> (iqs % 8) & 1) << 2);
     const int c1 = (x[ib].qs[(iqs + 1)/4] >> (((iqs + 1) % 4)*2) & 3) | ((x[ib].qh[(iqs + 1)/8] >> ((iqs + 1) % 8) & 1) << 2);
 
-    v.x = (2*c0 - 7) * d;
-    v.y = (2*c1 - 7) * d;
+    v.x = kQ3x32_levels[c0] * d;
+    v.y = kQ3x32_levels[c1] * d;
 }
 
 static __device__ __forceinline__ void dequantize_q2x32(const void * vx, const int64_t ib, const int iqs, float2 & v){
