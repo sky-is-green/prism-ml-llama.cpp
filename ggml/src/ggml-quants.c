@@ -2398,6 +2398,111 @@ size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     return nrow * row_size;
 }
 
+// ====================== Q3X32 / Q2X32 (PLE table, block 32, mid-rise) ======================
+// One fp16 scale per 32-element block: s = amax/(L-1); codes are uniform
+// mid-rise levels, decode x = (2c - (L-1))*s. See the Scion design note
+// PLE-TABLE-TYPES.md for the rule and the real-row measurements.
+
+void quantize_row_q3x32_ref(const float * GGML_RESTRICT x, block_q3x32 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3X32 == 0);
+    const int64_t nb = k / QK3X32;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK3X32; j++) {
+            amax = MAX(amax, fabsf(x[i*QK3X32 + j]));
+        }
+
+        const float d  = amax / 7.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        memset(y[i].qh, 0, sizeof(y[i].qh));
+
+        for (int j = 0; j < QK3X32; j++) {
+            const int c = MIN(MAX((int) roundf((x[i*QK3X32 + j]*id + 7.0f) * 0.5f), 0), 7);
+            y[i].qs[j/4] |= (uint8_t) (c & 3) << ((j % 4)*2);
+            y[i].qh[j/8] |= (uint8_t) (c >> 2) << (j % 8);
+        }
+    }
+}
+
+void dequantize_row_q3x32(const block_q3x32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3X32 == 0);
+    const int64_t nb = k / QK3X32;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < QK3X32; j++) {
+            const int c = (x[i].qs[j/4] >> ((j % 4)*2) & 3) | ((x[i].qh[j/8] >> (j % 8) & 1) << 2);
+            y[i*QK3X32 + j] = (2*c - 7) * d;
+        }
+    }
+}
+
+size_t quantize_q3x32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // table rows are quantized from their own values; an imatrix has no role
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q3X32, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q3x32_ref(src, (block_q3x32 *)qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+void quantize_row_q2x32_ref(const float * GGML_RESTRICT x, block_q2x32 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2X32 == 0);
+    const int64_t nb = k / QK2X32;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK2X32; j++) {
+            amax = MAX(amax, fabsf(x[i*QK2X32 + j]));
+        }
+
+        const float d  = amax / 3.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+
+        for (int j = 0; j < QK2X32; j++) {
+            const int c = MIN(MAX((int) roundf((x[i*QK2X32 + j]*id + 3.0f) * 0.5f), 0), 3);
+            y[i].qs[j/4] |= (uint8_t) c << ((j % 4)*2);
+        }
+    }
+}
+
+void dequantize_row_q2x32(const block_q2x32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2X32 == 0);
+    const int64_t nb = k / QK2X32;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < QK2X32; j++) {
+            const int c = (x[i].qs[j/4] >> ((j % 4)*2)) & 3;
+            y[i*QK2X32 + j] = (2*c - 3) * d;
+        }
+    }
+}
+
+size_t quantize_q2x32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // table rows are quantized from their own values; an imatrix has no role
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q2X32, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q2x32_ref(src, (block_q2x32 *)qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q4_0_ref(src, dst, (int64_t)nrow*n_per_row);

@@ -249,6 +249,19 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    // Q3X32 / Q2X32 are PLE table gather formats: no vec_dot, get_rows only.
+    [GGML_TYPE_Q3X32] = {
+        .from_float               = quantize_row_q3x32,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q2X32] = {
+        .from_float               = quantize_row_q2x32,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,

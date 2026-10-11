@@ -104,6 +104,11 @@ typedef sycl::half2 ggml_half2;
 #define QI_PTQ1_0 (QK_PTQ1_0 / 32)
 #define QR_PTQ1_0 1
 
+#define QI3X32 (QK3X32 / 32)
+#define QR3X32 1
+#define QI2X32 (QK2X32 / 32)
+#define QR2X32 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -218,6 +223,25 @@ typedef struct {
     ggml_half d;                                // scale
 } block_ptq1_0;
 static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
+// Q3X32 / Q2X32: Prism-private 32-element blocks for the PLE n-gram table
+// (160-element rows = 5 blocks). One fp16 scale per block and uniform
+// mid-rise codes; decode x = (2c - (L-1))*s with s = amax/(L-1).
+// See scion/docs/PLE-TABLE-TYPES.md for the rule and the row measurements.
+#define QK3X32 32
+typedef struct {
+    ggml_half d;            // scale, amax/7
+    uint8_t qs[QK3X32 / 4]; // low 2 bits of each code, 4 per byte
+    uint8_t qh[QK3X32 / 8]; // high 1 bit of each code, 8 per byte
+} block_q3x32;
+static_assert(sizeof(block_q3x32) == sizeof(ggml_half) + QK3X32/4 + QK3X32/8, "wrong q3x32 block size/padding");
+
+#define QK2X32 32
+typedef struct {
+    ggml_half d;            // scale, amax/3
+    uint8_t qs[QK2X32 / 4]; // 2 bits per code, 4 per byte
+} block_q2x32;
+static_assert(sizeof(block_q2x32) == sizeof(ggml_half) + QK2X32/4, "wrong q2x32 block size/padding");
 
 #define QK4_0 32
 typedef struct {

@@ -328,6 +328,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q3X32:
+            get_rows_cuda_q<QK3X32, QR3X32, dequantize_q3x32>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_Q2X32:
+            get_rows_cuda_q<QK2X32, QR2X32, dequantize_q2x32>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q2_0:
             get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

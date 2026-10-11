@@ -5582,6 +5582,8 @@ class GGMLQuantizationType(IntEnum):
     # layout is byte-identical (the C++ loader imports 43 as PQ2_0 as well)
     Q1_0_g128 = 43
     PTQ1_0  = 143
+    Q3X32   = 144
+    Q2X32   = 145
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5779,6 +5781,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
     GGMLQuantizationType.Q1_0_g128: (128, 2 + 32),
     GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
+    GGMLQuantizationType.Q3X32:   (32, 2 + 8 + 4),
+    GGMLQuantizationType.Q2X32:   (32, 2 + 8),
 }
 
 
