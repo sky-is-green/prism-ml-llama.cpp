@@ -17,10 +17,13 @@
 #include "llama-mtp-sidecar.h"
 #include "llama-sampler.h"
 #include "llama.h"
-
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -564,6 +567,10 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // Scion P5: start collecting before the first reserve so the reserve
+        // graph carries the stats tensors and their output pins
+        moe_router_stats_init();
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -587,6 +594,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    moe_router_stats_flush();
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1582,6 +1591,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // Scion P5: server slots decode concurrently and share the stats capture
+    // arrays; serialize the whole ubatch while the collector is enabled
+    std::unique_lock<std::recursive_mutex> moe_lock;
+    if (moe_stats.enabled) {
+        moe_lock = std::unique_lock<std::recursive_mutex>(moe_stats.mtx);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1609,12 +1625,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         res->reset();
 
+        moe_router_stats_clear();
+        moe_stats.capture = moe_stats.enabled;
+
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (moe_stats.enabled) {
+            // Scion P5: read the router tensors at compute time
+            ggml_backend_sched_set_eval_callback(sched.get(), moe_router_stats_eval_cb,
+                                                 const_cast<llama_context *>(this));
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+
+        moe_stats.capture = false;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1755,7 +1782,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                 {
                     // extract token embeddings
                     GGML_ASSERT(embd.data != nullptr);
-                    const uint32_t n_embd_out = hparams.n_embd_out();
+                    const uint32_t n_embd_out = (uint32_t) t_embd->ne[0];
 
                     GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
@@ -1773,7 +1800,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
                         // use n_embd_out (not n_embd_inp) - the pooled embedding has the model's
                         // output dimension, which differs from input dimension for deepstack models (e.g. qwen3vl)
-                        const uint32_t n_embd_out = hparams.n_embd_out();
+                        const uint32_t n_embd_out = (uint32_t) t_embd->ne[0];
                         embd_seq_out[seq_id].resize(n_embd_out);
                         ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
                     }
@@ -2177,7 +2204,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     {
                         // extract token embeddings
                         GGML_ASSERT(embd.data != nullptr);
-                        const uint32_t n_embd_out = hparams.n_embd_out();
+                        const uint32_t n_embd_out = (uint32_t) t_embd->ne[0];
                         float * embd_out = embd.data + n_outputs_prev*n_embd_out;
 
                         if (n_outputs) {
@@ -2195,7 +2222,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                         // use n_embd_out (not n_embd_inp) - the pooled embedding has the model's
                         // output dimension, which differs from input dimension for deepstack models (e.g. qwen3vl)
-                        const uint32_t n_embd_out = hparams.n_embd_out();
+                        const uint32_t n_embd_out = (uint32_t) t_embd->ne[0];
 
                         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                             const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
@@ -2792,6 +2819,7 @@ llm_graph_params llama_context::graph_params(
         /*.hadamard_inverses  =*/&model.hadamard_inverses,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
+        /*.moe_stats   =*/moe_stats.enabled,
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };
@@ -2828,6 +2856,10 @@ ggml_status llama_context::graph_compute(
 
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+        if (moe_stats.enabled) {
+            moe_router_stats_capture(cur, name, il);
+        }
+
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2851,6 +2883,337 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+//
+// Scion P5 shrink: MoE router usage stats
+//
+
+void llama_context::moe_router_stats_init() {
+    const char * path = getenv("SCION_MOE_STATS");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    moe_stats.enabled = true;
+    moe_stats.path    = strcmp(path, "1") == 0 ? "scion-moe-stats.json" : path;
+    if (const char * every = getenv("SCION_MOE_STATS_EVERY")) {
+        moe_stats.flush_every = std::max<int64_t>(1, atoll(every));
+    }
+
+    moe_stats.n_layer  = model.hparams.n_layer();
+    moe_stats.n_expert = model.hparams.n_expert;
+    moe_stats.topk.assign(moe_stats.n_layer, nullptr);
+    moe_stats.weights.assign(moe_stats.n_layer, nullptr);
+    moe_stats.probs.assign(moe_stats.n_layer, nullptr);
+    moe_stats.norms.assign(moe_stats.n_layer, nullptr);
+    moe_stats.counts.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0);
+    moe_stats.mass.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0.0);
+    moe_stats.mass_dense.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0.0);
+    moe_stats.reap.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0.0);
+    moe_stats.norm_sum.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0.0);
+    moe_stats.norm_sq.assign((size_t) moe_stats.n_layer * moe_stats.n_expert, 0.0);
+    moe_stats.layer_tokens.assign(moe_stats.n_layer, 0);
+    moe_stats.topk_host.assign(moe_stats.n_layer, {});
+    moe_stats.weights_host.assign(moe_stats.n_layer, {});
+
+    LLAMA_LOG_INFO("%s: MoE router stats -> %s (layers %" PRId64 ", experts %" PRId64 ", flush every %" PRId64 " tokens)\n",
+            __func__, moe_stats.path.c_str(), moe_stats.n_layer, moe_stats.n_expert, moe_stats.flush_every);
+}
+
+void llama_context::moe_router_stats_clear() {
+    std::lock_guard<std::recursive_mutex> lock(moe_stats.mtx);
+    if (!moe_stats.enabled) {
+        return;
+    }
+    std::fill(moe_stats.topk.begin(),    moe_stats.topk.end(),    nullptr);
+    std::fill(moe_stats.weights.begin(), moe_stats.weights.end(), nullptr);
+    std::fill(moe_stats.probs.begin(),   moe_stats.probs.end(),   nullptr);
+    std::fill(moe_stats.norms.begin(),   moe_stats.norms.end(),   nullptr);
+    for (auto & v : moe_stats.topk_host)    { v.clear(); }
+    for (auto & v : moe_stats.weights_host) { v.clear(); }
+}
+
+static int32_t moe_raw_i32(const std::vector<uint8_t> & raw, const ggml_tensor * t, int64_t j, int64_t i) {
+    int32_t v;
+    std::memcpy(&v, raw.data() + j*t->nb[0] + i*t->nb[1], sizeof(v));
+    return v;
+}
+
+static float moe_raw_f32_2d(const std::vector<uint8_t> & raw, const ggml_tensor * t, int64_t j, int64_t i) {
+    float v;
+    std::memcpy(&v, raw.data() + j*t->nb[0] + i*t->nb[1], sizeof(v));
+    return v;
+}
+
+static float moe_raw_f32_3d(const std::vector<uint8_t> & raw, const ggml_tensor * t, int64_t j, int64_t i) {
+    float v;
+    std::memcpy(&v, raw.data() + j*t->nb[1] + i*t->nb[2], sizeof(v));
+    return v;
+}
+
+void llama_context::moe_router_stats_capture(ggml_tensor * cur, const char * name, int il) const {
+    std::lock_guard<std::recursive_mutex> lock(moe_stats.mtx);
+    if (!moe_stats.enabled || !moe_stats.capture || il < 0 || il >= moe_stats.n_layer) {
+        return;
+    }
+
+    if (strcmp(name, "ffn_moe_topk") == 0) {
+        moe_stats.topk[il] = cur;
+    } else if (strcmp(name, "ffn_moe_probs") == 0) {
+        moe_stats.probs[il] = cur;
+    } else if (strcmp(name, "ffn_moe_down_norm") == 0) {
+        moe_stats.norms[il] = cur;
+    } else if (strcmp(name, "ffn_moe_weights") == 0 ||
+               strcmp(name, "ffn_moe_weights_norm") == 0 ||
+               strcmp(name, "ffn_moe_weights_scaled") == 0) {
+        // the nodes are built in application order: the last one is applied
+        moe_stats.weights[il] = cur;
+    }
+}
+
+// field ids for is_captured/observe
+enum {
+    MOE_FIELD_TOPK = 1,
+    MOE_FIELD_PROBS,
+    MOE_FIELD_NORM,
+    MOE_FIELD_WEIGHTS,
+};
+
+bool llama_context::moe_router_stats_is_captured(ggml_tensor * cur, int & field, int & il) const {
+    for (int64_t l = 0; l < (int64_t) moe_stats.topk.size(); ++l) {
+        if (moe_stats.topk[l] == cur)    { field = MOE_FIELD_TOPK;    il = (int) l; return true; }
+        if (moe_stats.probs[l] == cur)   { field = MOE_FIELD_PROBS;   il = (int) l; return true; }
+        if (moe_stats.norms[l] == cur)   { field = MOE_FIELD_NORM;    il = (int) l; return true; }
+        if (moe_stats.weights[l] == cur) { field = MOE_FIELD_WEIGHTS; il = (int) l; return true; }
+    }
+    return false;
+}
+
+// The scheduler calls this right after each captured tensor is computed, so
+// the buffer is guaranteed to be live.  Top-k ids and routing weights are
+// parked per layer; the expert-norm event of the same layer combines them.
+void llama_context::moe_router_stats_observe(ggml_tensor * cur) const {
+    std::lock_guard<std::recursive_mutex> lock(moe_stats.mtx);
+    if (!moe_stats.enabled || moe_stats.n_expert <= 0) {
+        return;
+    }
+
+    int field = 0, il = -1;
+    if (!moe_router_stats_is_captured(cur, field, il)) {
+        return;
+    }
+
+    const int64_t ne = moe_stats.n_expert;
+
+    if (field == MOE_FIELD_PROBS) {
+        const int64_t n_tok = cur->ne[1];
+        if (cur->ne[0] != ne || n_tok <= 0) {
+            return;
+        }
+        std::vector<uint8_t> raw(ggml_nbytes(cur));
+        ggml_backend_tensor_get(cur, raw.data(), 0, raw.size());
+        double * d = moe_stats.mass_dense.data() + (size_t) il * ne;
+        for (int64_t i = 0; i < n_tok; ++i) {
+            for (int64_t e = 0; e < ne; ++e) {
+                d[e] += moe_raw_f32_2d(raw, cur, e, i);
+            }
+        }
+        return;
+    }
+
+    if (field == MOE_FIELD_TOPK) {
+        const int64_t n_used = cur->ne[0];
+        const int64_t n_tok  = cur->ne[1];
+        if (n_used <= 0 || n_tok <= 0) {
+            return;
+        }
+        std::vector<uint8_t> raw(ggml_nbytes(cur));
+        ggml_backend_tensor_get(cur, raw.data(), 0, raw.size());
+        std::vector<int32_t> & tk = moe_stats.topk_host[il];
+        tk.resize(n_used * n_tok);
+        for (int64_t i = 0; i < n_tok; ++i) {
+            for (int64_t j = 0; j < n_used; ++j) {
+                tk[j + i*n_used] = moe_raw_i32(raw, cur, j, i);
+            }
+        }
+        return;
+    }
+
+    if (field == MOE_FIELD_WEIGHTS) {
+        const bool w3d = cur->ne[0] == 1 && cur->ne[2] > 1;
+        const int64_t n_used = w3d ? cur->ne[1] : cur->ne[0];
+        const int64_t n_tok  = w3d ? cur->ne[2] : cur->ne[1];
+        if (n_used <= 0 || n_tok <= 0) {
+            return;
+        }
+        std::vector<uint8_t> raw(ggml_nbytes(cur));
+        ggml_backend_tensor_get(cur, raw.data(), 0, raw.size());
+        std::vector<float> & wh = moe_stats.weights_host[il];
+        wh.resize(n_used * n_tok);
+        for (int64_t i = 0; i < n_tok; ++i) {
+            for (int64_t j = 0; j < n_used; ++j) {
+                wh[j + i*n_used] = w3d ? moe_raw_f32_3d(raw, cur, j, i)
+                                       : moe_raw_f32_2d(raw, cur, j, i);
+            }
+        }
+        return;
+    }
+
+    if (field == MOE_FIELD_NORM) {
+        const int64_t n_used = cur->ne[1];
+        const int64_t n_tok  = cur->ne[2];
+        if (cur->ne[0] != 1 || n_used <= 0 || n_tok <= 0) {
+            return;
+        }
+        const std::vector<int32_t> & tk = moe_stats.topk_host[il];
+        const std::vector<float>   & wh = moe_stats.weights_host[il];
+        if ((int64_t) tk.size() != n_used * n_tok ||
+            (int64_t) wh.size() != n_used * n_tok) {
+            return; // a piece is missing for this ubatch; skip it
+        }
+        std::vector<uint8_t> raw(ggml_nbytes(cur));
+        ggml_backend_tensor_get(cur, raw.data(), 0, raw.size());
+
+        uint64_t * c  = moe_stats.counts.data()     + (size_t) il * ne;
+        double   * m  = moe_stats.mass.data()       + (size_t) il * ne;
+        double   * rp = moe_stats.reap.data()       + (size_t) il * ne;
+        double   * ns = moe_stats.norm_sum.data()   + (size_t) il * ne;
+        double   * nq = moe_stats.norm_sq.data()    + (size_t) il * ne;
+        for (int64_t i = 0; i < n_tok; ++i) {
+            for (int64_t j = 0; j < n_used; ++j) {
+                const int32_t e = tk[j + i*n_used];
+                if (e < 0 || e >= ne) {
+                    continue;
+                }
+                const float n = moe_raw_f32_3d(raw, cur, j, i);
+                const float w = wh[j + i*n_used];
+                c[e]++;
+                m[e] += w;
+                rp[e] += (double) w * n;
+                ns[e] += n;
+                nq[e] += (double) n * n;
+            }
+        }
+        moe_stats.layer_tokens[il] += n_tok;
+        moe_stats.topk_host[il].clear();
+        moe_stats.weights_host[il].clear();
+
+        if (il == 0) {
+            moe_stats.n_tokens += n_tok;
+            if (moe_stats.n_tokens - moe_stats.last_flush >= moe_stats.flush_every) {
+                moe_router_stats_flush();
+            }
+        }
+    }
+}
+
+bool llama_context::moe_router_stats_eval(ggml_tensor * t, bool ask) const {
+    std::lock_guard<std::recursive_mutex> lock(moe_stats.mtx);
+    if (!moe_stats.enabled) {
+        return cparams.cb_eval ? cparams.cb_eval(t, ask, cparams.cb_eval_user_data) : true;
+    }
+
+    int field = 0, il = -1;
+    const bool ours = moe_router_stats_is_captured(t, field, il);
+
+    if (ask) {
+        bool user_need = false;
+        if (cparams.cb_eval) {
+            user_need = cparams.cb_eval(t, true, cparams.cb_eval_user_data);
+        }
+        moe_stats.eval_user_tensor = user_need ? t : nullptr;
+        return user_need || ours;
+    }
+
+    if (ours) {
+        moe_router_stats_observe(t);
+    }
+    if (moe_stats.eval_user_tensor == t && cparams.cb_eval) {
+        return cparams.cb_eval(t, false, cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
+bool llama_context::moe_router_stats_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    return static_cast<const llama_context *>(user_data)->moe_router_stats_eval(t, ask);
+}
+
+void llama_context::moe_router_stats_flush() const {
+    std::lock_guard<std::recursive_mutex> lock(moe_stats.mtx);
+    if (!moe_stats.enabled) {
+        return;
+    }
+
+    int64_t n_used = 0;
+    for (const ggml_tensor * t : moe_stats.topk) {
+        if (t != nullptr) {
+            n_used = t->ne[0];
+            break;
+        }
+    }
+
+    const std::string tmp = moe_stats.path + ".tmp";
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, tmp.c_str());
+        return;
+    }
+
+    const int64_t ne = moe_stats.n_expert;
+    f << "{\n";
+    f << "  \"format\": \"scion-moe-router-stats\",\n";
+    f << "  \"version\": 2,\n";
+    f << "  \"n_layer\": " << moe_stats.n_layer << ",\n";
+    f << "  \"n_expert\": " << ne << ",\n";
+    f << "  \"n_expert_used\": " << n_used << ",\n";
+    f << "  \"tokens\": " << moe_stats.n_tokens << ",\n";
+    f << "  \"layers\": [\n";
+    f.precision(9);
+    for (int64_t il = 0; il < moe_stats.n_layer; ++il) {
+        const uint64_t * c = moe_stats.counts.data()    + il * ne;
+        const double   * m = moe_stats.mass.data()      + il * ne;
+        const double   * d = moe_stats.mass_dense.data() + il * ne;
+        const double   * r = moe_stats.reap.data()      + il * ne;
+        const double   * ns = moe_stats.norm_sum.data() + il * ne;
+        const double   * nq = moe_stats.norm_sq.data()  + il * ne;
+        f << "    {\"il\": " << il << ", \"tokens\": " << moe_stats.layer_tokens[il] << ", \"counts\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << c[e];
+        }
+        f << "], \"mass\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << m[e];
+        }
+        f << "], \"mass_dense\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << d[e];
+        }
+        f << "], \"reap\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << r[e];
+        }
+        f << "], \"norm_sum\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << ns[e];
+        }
+        f << "], \"norm_sq\": [";
+        for (int64_t e = 0; e < ne; ++e) {
+            f << (e ? "," : "") << nq[e];
+        }
+        f << "]}" << (il + 1 < moe_stats.n_layer ? "," : "") << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+    f.close();
+
+    if (std::rename(tmp.c_str(), moe_stats.path.c_str()) != 0) {
+        LLAMA_LOG_ERROR("%s: cannot rename %s -> %s\n", __func__, tmp.c_str(), moe_stats.path.c_str());
+        return;
+    }
+
+    moe_stats.last_flush = moe_stats.n_tokens;
+    LLAMA_LOG_INFO("%s: wrote %s (%" PRId64 " tokens)\n", __func__, moe_stats.path.c_str(), moe_stats.n_tokens);
 }
 
 //

@@ -1218,7 +1218,10 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        // Scion: Qwen4Exp's hybrid KV (GDN) aborts in this probe's tensor
+        // read-back (ggml_backend_tensor_get_async); short-context serving
+        // never removes sequences, so report "not supported" directly.
+        ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }

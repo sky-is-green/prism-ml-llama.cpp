@@ -1522,6 +1522,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
     samplers(params.samplers),
+    moe_stats(params.moe_stats),
     cb_func(params.cb),
     res(params.res),
     ctx0(res->get_ctx()),
@@ -2381,6 +2382,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    if (moe_stats && !weight_before_ffn) {
+        // Scion P5: per (token, used expert) output L2 norm; the host combines
+        // it with the gate weights into the REAP saliency signal
+        ggml_tensor * norms = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, experts)));
+        cb(norms, "ffn_moe_down_norm", il);
+        ggml_build_forward_expand(gf, norms);
     }
 
     if (!weight_before_ffn) {

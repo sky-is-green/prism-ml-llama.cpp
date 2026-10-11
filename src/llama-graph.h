@@ -883,6 +883,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    bool moe_stats = false; // Scion P5: emit the MoE expert-norm node
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -1133,6 +1135,10 @@ struct llm_graph_context {
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // Scion P5: when set, build_moe_ffn emits the per-expert output-norm node
+    // the router-stats collector accumulates (REAP signal)
+    bool moe_stats = false;
 
     const llm_graph_cb & cb_func;
 

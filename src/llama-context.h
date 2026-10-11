@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -286,6 +287,16 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // Scion P5 shrink: env-gated MoE router usage stats (SCION_MOE_STATS=<path>)
+    void moe_router_stats_init();
+    void moe_router_stats_clear();
+    void moe_router_stats_capture(ggml_tensor * cur, const char * name, int il) const;
+    bool moe_router_stats_is_captured(ggml_tensor * cur, int & field, int & il) const;
+    void moe_router_stats_observe(ggml_tensor * cur) const;
+    bool moe_router_stats_eval(ggml_tensor * t, bool ask) const;
+    static bool moe_router_stats_eval_cb(ggml_tensor * t, bool ask, void * user_data);
+    void moe_router_stats_flush() const;
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -405,6 +416,44 @@ private:
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
+
+    // Scion P5 shrink: per-expert router counts and weight mass, flushed as JSON.
+    // capture is true only while a real compute graph is built, so reserve graphs
+    // never overwrite the captured tensors.
+    struct moe_router_stats {
+        bool enabled = false;
+        bool capture = false;
+        std::string path;
+        int64_t flush_every = 8192;
+        int64_t last_flush  = 0;
+        int64_t n_tokens    = 0;
+        int64_t n_layer     = 0;
+        int64_t n_expert    = 0;
+        std::vector<ggml_tensor *> topk;    // per layer [n_expert_used, n_tokens] I32
+        std::vector<ggml_tensor *> weights; // per layer, last routing weight node
+        std::vector<ggml_tensor *> probs;   // per layer [n_expert, n_tokens] F32
+        std::vector<ggml_tensor *> norms;   // per layer [1, n_expert_used, n_tokens] F32
+        std::vector<uint64_t> counts;       // [n_layer * n_expert] top-k selections
+        std::vector<double>   mass;         // [n_layer * n_expert] selected weight sum
+        std::vector<double>   mass_dense;   // [n_layer * n_expert] full softmax mass
+        std::vector<double>   reap;         // [n_layer * n_expert] sum gate*norm (REAP)
+        std::vector<double>   norm_sum;     // [n_layer * n_expert] sum expert-output norms
+        std::vector<double>   norm_sq;      // [n_layer * n_expert] sum norms squared
+        std::vector<uint64_t> layer_tokens; // [n_layer] tokens the router saw
+
+        // per-layer scratch filled in the eval callback: the top-k ids and the
+        // routing weights are read the moment their node is computed, and the
+        // combine happens when the expert-norm node of the same layer lands
+        std::vector<std::vector<int32_t>> topk_host;
+        std::vector<std::vector<float>>   weights_host;
+        mutable ggml_tensor * eval_user_tensor = nullptr;
+
+        // serializes process_ubatch while stats are collected: the server
+        // decodes several slots concurrently and the capture arrays are shared
+        mutable std::recursive_mutex mtx;
+    };
+
+    mutable moe_router_stats moe_stats;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
