@@ -96,6 +96,18 @@ static __device__ __forceinline__ void dequantize_q2x32(const void * vx, const i
     v.y = (2*c1 - 3) * d;
 }
 
+static __device__ __forceinline__ void dequantize_q4x160(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q4x160 * x = (const block_q4x160 *) vx;
+
+    const float d = x[ib].d;
+
+    // qr == 2: iqs in [0, QK4X160/2); low nibble = element iqs, high = iqs + 80
+    const int vui = x[ib].qs[iqs];
+
+    v.x = kQ4x160_levels[vui & 0x0F] * d;
+    v.y = kQ4x160_levels[vui >>   4] * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

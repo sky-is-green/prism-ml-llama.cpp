@@ -75,6 +75,21 @@ static void ref_decode_row(enum ggml_type type, const uint8_t * row, float * out
                 }
             }
             break;
+        case GGML_TYPE_Q4X160: {
+            // codebook levels must match kQ4x160_levels in the fork's ggml
+            static const float levels[16] = {
+                -0.830319583f, -0.56551832f, -0.395098478f, -0.278073937f,
+                -0.207071558f, -0.134492248f, -0.105560891f, -0.0803469718f,
+                8.09813901e-06f, 0.0911125243f, 0.129564166f, 0.206828877f,
+                0.278073341f, 0.395026445f, 0.564443111f, 0.827598035f,
+            };
+            const float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *) row);
+            const uint8_t * qs = row + 2;
+            for (int j = 0; j < 80; j++) {
+                out[j]      = levels[qs[j] & 0x0F] * d;
+                out[j + 80] = levels[qs[j] >>   4] * d;
+            }
+        } break;
         default:
             std::fprintf(stderr, "no reference decoder for type %d\n", (int) type);
             std::abort();
@@ -86,6 +101,7 @@ static size_t expected_row_bytes(enum ggml_type type) {
         case GGML_TYPE_Q4_0: return 90;
         case GGML_TYPE_Q3X32: return 70;
         case GGML_TYPE_Q2X32: return 50;
+        case GGML_TYPE_Q4X160: return 82;
         default: return 0;
     }
 }

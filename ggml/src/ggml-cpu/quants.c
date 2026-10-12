@@ -46,6 +46,10 @@ void quantize_row_q2x32(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_q2x32_ref(x, y, k);
 }
 
+void quantize_row_q4x160(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4x160_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }

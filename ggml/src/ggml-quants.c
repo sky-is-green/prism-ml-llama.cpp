@@ -2551,6 +2551,82 @@ size_t quantize_q2x32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+void quantize_row_q4x160_ref(const float * GGML_RESTRICT x, block_q4x160 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK4X160 == 0);
+    const int64_t nb = k / QK4X160;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK4X160;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK4X160; j++) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+
+        // least-squares scale for the fixed 16-level codebook
+        float s = amax / kQ4x160_levels[15];
+        for (int it = 0; it < 3; it++) {
+            float num = 0.0f;
+            float den = 0.0f;
+            for (int j = 0; j < QK4X160; j++) {
+                float best = fabsf(xb[j] - s*kQ4x160_levels[0]);
+                int bc = 0;
+                for (int l = 1; l < 16; l++) {
+                    const float dist = fabsf(xb[j] - s*kQ4x160_levels[l]);
+                    if (dist < best) { best = dist; bc = l; }
+                }
+                num += xb[j]*kQ4x160_levels[bc];
+                den += kQ4x160_levels[bc]*kQ4x160_levels[bc];
+            }
+            s = den > 0.0f ? num/den : 0.0f;
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(s);
+        const float sd = GGML_FP16_TO_FP32(y[i].d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK4X160; j++) {
+            float best = fabsf(xb[j] - sd*kQ4x160_levels[0]);
+            int bc = 0;
+            for (int l = 1; l < 16; l++) {
+                const float dist = fabsf(xb[j] - sd*kQ4x160_levels[l]);
+                if (dist < best) { best = dist; bc = l; }
+            }
+            const int jj = j < QK4X160/2 ? j : j - QK4X160/2;  // byte index
+            const int sh = j < QK4X160/2 ? 0 : 4;              // low/high nibble
+            y[i].qs[jj] |= (uint8_t) bc << sh;
+        }
+    }
+}
+
+void dequantize_row_q4x160(const block_q4x160 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK4X160 == 0);
+    const int64_t nb = k / QK4X160;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < QK4X160/2; j++) {
+            const int lo = x[i].qs[j] & 0x0F;
+            const int hi = x[i].qs[j] >> 4;
+            y[i*QK4X160 + j]             = kQ4x160_levels[lo] * d;
+            y[i*QK4X160 + j + QK4X160/2] = kQ4x160_levels[hi] * d;
+        }
+    }
+}
+
+size_t quantize_q4x160(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // table rows are quantized from their own values; an imatrix has no role
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4X160, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4x160_ref(src, (block_q4x160 *)qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q4_0_ref(src, dst, (int64_t)nrow*n_per_row);

@@ -434,9 +434,10 @@ extern "C" {
         // slots above upstream types; type_traits is sized to COUNT with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_Q3X32 = 144, // Prism-private PLE table, 32-elem blocks, mid-rise 3-bit
-        GGML_TYPE_Q2X32 = 145, // Prism-private PLE table, 32-elem blocks, mid-rise 2-bit
-        GGML_TYPE_COUNT   = 146,
+        GGML_TYPE_Q3X32 = 144, // Prism-private PLE table, 32-elem blocks, 3-bit codebook
+        GGML_TYPE_Q2X32 = 145, // Prism-private PLE table, 32-elem blocks, 2-bit mid-rise
+        GGML_TYPE_Q4X160 = 146, // Prism-private PLE table, 160-elem rows, 4-bit codebook
+        GGML_TYPE_COUNT   = 147,
     };
 
     // precision

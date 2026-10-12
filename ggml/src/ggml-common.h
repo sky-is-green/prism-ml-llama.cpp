@@ -108,6 +108,8 @@ typedef sycl::half2 ggml_half2;
 #define QR3X32 1
 #define QI2X32 (QK2X32 / 32)
 #define QR2X32 1
+#define QI4X160 (QK4X160 / 32)
+#define QR4X160 2
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -242,6 +244,16 @@ typedef struct {
     uint8_t qs[QK2X32 / 4]; // 2 bits per code, 4 per byte
 } block_q2x32;
 static_assert(sizeof(block_q2x32) == sizeof(ggml_half) + QK2X32/4, "wrong q2x32 block size/padding");
+
+// Q4X160: one 160-element PLE table row per block, 4-bit codes into a fixed
+// 16-level codebook and one fp16 scale. Nibble layout matches Q4_0: byte j
+// holds element j in the low nibble and element j+80 in the high nibble.
+#define QK4X160 160
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t qs[QK4X160 / 2];  // 4-bit codes, 2 per byte
+} block_q4x160;
+static_assert(sizeof(block_q4x160) == sizeof(ggml_half) + QK4X160/2, "wrong q4x160 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -1178,6 +1190,15 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(float, kQ3x32_levels, 8)
     -5.17308617f, -3.14964318f, -1.84705281f, -0.830217063f,
      0.371574461f, 1.65762842f, 3.0041852f, 5.05979347f,
+GGML_TABLE_END()
+
+// Q4X160 codebook: 16 levels trained on the release PLE table. The 4-bit code
+// is the index into this table.
+GGML_TABLE_BEGIN(float, kQ4x160_levels, 16)
+    -0.830319583f, -0.56551832f, -0.395098478f, -0.278073937f,
+    -0.207071558f, -0.134492248f, -0.105560891f, -0.0803469718f,
+    8.09813901e-06f, 0.0911125243f, 0.129564166f, 0.206828877f,
+    0.278073341f, 0.395026445f, 0.564443111f, 0.827598035f,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
