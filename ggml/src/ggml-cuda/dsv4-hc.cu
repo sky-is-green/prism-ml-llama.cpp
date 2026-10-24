@@ -292,3 +292,130 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
+
+
+// ---- Strata-DS4: GGML_OP_DSV41_FAKE_QUANT - DeepSeek-V4.1's activation quantize-dequantize in one kernel.
+// tools/v41/engine/ds41_ops.hpp builds it from ~45 stock ops per call (abs, pool max, clamp, div, scale, step, ...);
+// this repeats that composite step for step under the same -use_fast_math flags, so the values are bit-identical:
+// a stock binary op is one plain op (__fadd_rn / __fsub_rn / __fmul_rn: .rn.ftz, never contracted, = binbcast's
+// a op b), division is '/' (div.approx.ftz, = binbcast's op_div), ggml_scale is scale_f32's `scale * x + bias` = one
+// FMA (__fmaf_rn), abs = fabsf, step = x > 0, clamp = fminf(fmaxf), the pool's max = fmaxf over the block.
+
+static __device__ __forceinline__ float dsv41_fq_scale(float x, float s, float b) { return __fmaf_rn(s, x, b); }
+static __device__ __forceinline__ float dsv41_fq_step(float x) { return x > 0.0f ? 1.0f : 0.0f; }
+static __device__ __forceinline__ float dsv41_fq_clamp(float x, float lo, float hi) { return fminf(fmaxf(x, lo), hi); }
+
+static __device__ __forceinline__ float dsv41_fq_pow2_ceil(float a) {
+    const float g  = dsv41_fq_scale(a, 8388609.0f, 0.0f);                 // a * (2^23 + 1)
+    const float hi = __fadd_rn(g, __fsub_rn(a, g));                        // a rounded to 1 significant bit
+    return __fmul_rn(hi, dsv41_fq_scale(dsv41_fq_step(__fsub_rn(a, hi)), 1.0f, 1.0f));
+}
+
+static __device__ __forceinline__ float dsv41_fq_pow2_floor(float a) {
+    const float f = dsv41_fq_pow2_ceil(a);
+    return __fmul_rn(f, dsv41_fq_scale(dsv41_fq_step(__fsub_rn(f, a)), -0.5f, 1.0f));
+}
+
+static __device__ __forceinline__ float dsv41_fq_round_fmt(float v, int mbits, float min_normal) {
+    const float p = dsv41_fq_clamp(dsv41_fq_pow2_floor(fabsf(v)), min_normal, INFINITY);
+    const float k = (float) (1 << mbits);
+    const float C = 12582912.0f;                                           // 1.5 * 2^23: round half to even
+    const float y = dsv41_fq_scale(v / p, k, 0.0f);
+    const float r = dsv41_fq_scale(dsv41_fq_scale(y, 1.0f, C), 1.0f, -C);
+    return __fmul_rn(dsv41_fq_scale(r, 1.0f / k, 0.0f), p);
+}
+
+// one thread per element; a block of BS elements = BS consecutive lanes (n % BS == 0, so a lane group is wholly in or
+// wholly out of range and every lane takes part in the shuffles)
+template <int BS>
+static __global__ void dsv41_fake_quant_f32(const float * __restrict__ x, float * __restrict__ y, const int64_t n,
+                                            const int mode, const float maxv, const float floor_) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const float xi = i < n ? x[i] : 0.0f;
+    float a = i < n ? fabsf(xi) : -FLT_MAX;
+#pragma unroll
+    for (int o = BS / 2; o > 0; o >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o, BS));
+    }
+    if (i >= n) {
+        return;
+    }
+    const float t = dsv41_fq_clamp(a, floor_, INFINITY) / maxv;
+    const float s = mode == 1 ? dsv41_fq_round_fmt(t, 3, 0x1p-6f) : dsv41_fq_pow2_ceil(t);
+    const float v = dsv41_fq_clamp(xi / s, -maxv, maxv);
+    const float q = mode == 0 ? dsv41_fq_round_fmt(v, 3, 0x1p-6f) : dsv41_fq_round_fmt(v, 1, 1.0f);
+    y[i] = __fmul_rn(q, s);
+}
+
+void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
+    const int mode = ggml_get_op_params_i32(dst, 0);
+    const int64_t n = ggml_nelements(src0);
+    const float maxv = mode == 0 ? 448.0f : 6.0f;
+    const float floor_ = mode == 0 ? 1e-4f : mode == 1 ? 6.0f / 512.0f : 6.0f * 0x1p-126f;
+    const int64_t blocks = (n + 255) / 256;
+    cudaStream_t stream = ctx.stream();
+    if (mode == 1) {
+        GGML_ASSERT(n % 16 == 0);
+        dsv41_fake_quant_f32<16><<<blocks, 256, 0, stream>>>((const float *) src0->data, (float *) dst->data, n, mode, maxv, floor_);
+    } else {
+        GGML_ASSERT(n % 32 == 0);
+        dsv41_fake_quant_f32<32><<<blocks, 256, 0, stream>>>((const float *) src0->data, (float *) dst->data, n, mode, maxv, floor_);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+// ---- Strata-DS4: GGML_OP_DSV41_HC_MIXES - the two HC mixes of one model.py Block.hc_mixes in one kernel.
+// tools/v41/engine/ds41_dense.cpp hc_mixes builds them from mul + add + sigmoid + ggml_scale(_bias); this repeats that
+// composite step for step under the same -use_fast_math flags, so the values are bit-identical:
+// a stock binary op is one plain op (__fmul_rn / __fadd_rn: .rn.ftz, never contracted, = binbcast's a op b), ggml_scale
+// is scale_f32's `scale * x + bias` = one FMA (__fmaf_rn), sigmoid is unary_op_kernel's op_sigmoid.
+static __device__ __forceinline__ float dsv41_hc_mix_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// one thread per output element: dst [hc, 2*nt] = [ pre | post ]
+static __global__ void dsv41_hc_mixes_f32(
+        const float * __restrict__ mixes,
+        const int64_t nrow,                                // mixes->ne[0] = 2*hc (+ hc*hc comb rows the op does not read)
+        const float * __restrict__ scale,
+        const float * __restrict__ base,
+        float * __restrict__ dst,
+        const int64_t hc,
+        const int64_t nt,
+        const float eps) {
+    const int64_t n = 2*hc*nt;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t h    = i % hc;
+    const int64_t col  = i / hc;                       // 0..nt-1 = the pre mix, nt..2*nt-1 = the post mix
+    const int64_t post = col >= nt;
+    const int64_t t    = post ? col - nt : col;
+    const int64_t r    = post ? hc + h : h;
+    const float   v    = __fadd_rn(__fmul_rn(mixes[r + nrow*t], scale[post]), base[r]);
+    const float   s    = dsv41_hc_mix_sigmoid(v);
+    dst[i] = post ? __fmaf_rn(2.0f, s, 0.0f) : __fmaf_rn(1.0f, s, eps);
+}
+
+void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
+    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->ne[1] % 2 == 0 && mixes->ne[0] >= dst->ne[0] * 2);
+    const int64_t hc = base->ne[0] / 2;
+    const int64_t nt = dst->ne[1] / 2;
+    const float   eps = ggml_get_op_params_f32(dst, 0);
+    const int64_t n = 2*hc*nt;
+    const int64_t blocks = (n + 255) / 256;
+    cudaStream_t stream = ctx.stream();
+    dsv41_hc_mixes_f32<<<blocks, 256, 0, stream>>>((const float *) mixes->data, mixes->ne[0], (const float *) scale->data,
+                                                   (const float *) base->data, (float *) dst->data, hc, nt, eps);
+    CUDA_CHECK(cudaGetLastError());
+}

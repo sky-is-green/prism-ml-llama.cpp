@@ -583,6 +583,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV41_FAKE_QUANT,
+        GGML_OP_DSV41_HC_MIXES,
 
         GGML_OP_UNARY,
 
@@ -2687,6 +2689,29 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Strata-DS4: DeepSeek-V4.1's activation quantize-dequantize (model.py act_quant / fp4_act_quant) in one op, the
+    // same values as the stock-op composite tools/v41/engine/ds41_ops.hpp ds41_fake_quant builds (bit for bit on CUDA):
+    //   mode 0: FP8 E4M3, blocks of 32, power-of-two scale     mode 1: FP4 E2M1, blocks of 16, E4M3 scale
+    //   mode 2: FP4 E2M1, blocks of 32, power-of-two scale
+    // a: F32, contiguous, ggml_nelements(a) % block == 0; result: a's shape
+    GGML_API struct ggml_tensor * ggml_dsv41_fake_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   mode);
+
+    // Strata-DS4: the HC pre/post mixes of one model.py Block.hc_mixes in ONE op - the same values as the stock-op
+    // composite tools/v41/engine/ds41_dense.cpp hc_mixes builds (mul, add, sigmoid, ggml_scale / ggml_scale_bias), bit for
+    // bit on CUDA and CPU.  Replaces 4 nodes per mix with 1: 16 of every layer's ~82 tiny kernels.
+    //   mixes: F32 [2*hc, n_tokens] contiguous   scale: F32 [2]   base: F32 [2*hc]   result: F32 [hc, 2*n_tokens]
+    //   result[h, t]        = sigmoid(mixes[h,      t]*scale[0] + base[h])      * 1 + eps   (the pre mix)
+    //   result[h, nt + t]   = sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h]) * 2 + 0     (the post mix)
+    GGML_API struct ggml_tensor * ggml_dsv41_hc_mixes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps);
 
     // custom operators
 

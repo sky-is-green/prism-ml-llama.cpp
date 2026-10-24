@@ -12070,3 +12070,92 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_dsv41_fake_quant (Strata-DS4): DeepSeek-V4.1's activation quantize-dequantize, the same steps as
+// tools/v41/engine/ds41_ops.hpp (exact float tricks: Veltkamp power-of-two split, round-half-even by 1.5 * 2^23)
+
+static inline float dsv41_pow2_ceil(float a) {
+    // volatile: the split needs the ROUNDED product - contracted into fma(-a, c, a) (GNU mode, -march=native) it is
+    // not a split at all
+    const volatile float g = a * 8388609.0f;
+    const float hi = g + (a - g);
+    return hi * ((a - hi > 0.0f ? 1.0f : 0.0f) + 1.0f);
+}
+
+static inline float dsv41_pow2_floor(float a) {
+    const float f = dsv41_pow2_ceil(a);
+    return f * ((f - a > 0.0f ? 1.0f : 0.0f) * -0.5f + 1.0f);
+}
+
+static inline float dsv41_round_fmt(float v, int mbits, float min_normal) {
+    const float p = fminf(fmaxf(dsv41_pow2_floor(fabsf(v)), min_normal), INFINITY);
+    const float k = (float) (1 << mbits);
+    const float C = 12582912.0f;
+    const float y = (v / p) * k;
+    const volatile float yc = y + C;   // round half to even: the add must round on its own
+    const float r = yc - C;
+    return (r * (1.0f / k)) * p;
+}
+
+void ggml_compute_forward_dsv41_fake_quant(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
+    const int mode = ggml_get_op_params_i32(dst, 0);
+    const int bs = mode == 1 ? 16 : 32;
+    const bool fp8 = mode == 0;
+    const float maxv = fp8 ? 448.0f : 6.0f;
+    const float floor_ = fp8 ? 1e-4f : mode == 1 ? 6.0f / 512.0f : 6.0f * 0x1p-126f;
+    const int64_t nb = ggml_nelements(src0) / bs;
+    const int64_t b0 = nb * params->ith / params->nth, b1 = nb * (params->ith + 1) / params->nth;
+    const float * x = (const float *) src0->data;
+    float * y = (float *) dst->data;
+    for (int64_t b = b0; b < b1; ++b) {
+        float amax = -FLT_MAX;
+        for (int i = 0; i < bs; ++i) amax = fmaxf(amax, fabsf(x[b * bs + i]));
+        const float t = fminf(fmaxf(amax, floor_), INFINITY) / maxv;
+        const float s = mode == 1 ? dsv41_round_fmt(t, 3, 0x1p-6f) : dsv41_pow2_ceil(t);
+        for (int i = 0; i < bs; ++i) {
+            const float v = fminf(fmaxf(x[b * bs + i] / s, -maxv), maxv);
+            const float q = fp8 ? dsv41_round_fmt(v, 3, 0x1p-6f) : dsv41_round_fmt(v, 1, 1.0f);
+            y[b * bs + i] = q * s;
+        }
+    }
+}
+
+// ggml_compute_forward_dsv41_hc_mixes (Strata-DS4): the two HC mixes of one model.py Block.hc_mixes.  The same steps,
+// in the same order, as the engine's stock-op composite (ggml_compute_forward_mul -> ggml_vec_mul_f32,
+// ggml_compute_forward_add -> ggml_vec_add_f32, ggml_compute_forward_sigmoid -> ggml_vec_sigmoid_f32,
+// ggml_compute_forward_scale -> ggml_vec_scale_f32 / ggml_vec_mad1_f32): one plain product, one plain sum (volatile:
+// the product must round on its own, GNU mode contracts a*b+c into fma and the composite is two ops), the sigmoid, and
+// s*1 + eps / s*2 + 0 (exactly the scale the composite applies, `fma(x, 1, eps)` == `x + eps`).
+void ggml_compute_forward_dsv41_hc_mixes(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
+    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->ne[0] >= 2 * (base->ne[0] / 2));
+    const int64_t hc = base->ne[0] / 2;
+    const int64_t nt = dst->ne[1] / 2;
+    const int64_t nrow = mixes->ne[0];   // 2*hc; a Block.hc_mixes mixes tensor carries the comb rows after them
+    const float   eps = ggml_get_op_params_f32(dst, 0);
+    const float * mx = (const float *) mixes->data;
+    const float * sc = (const float *) scale->data;
+    const float * bs = (const float *) base->data;
+    float * y = (float *) dst->data;
+    const int64_t n = 2*hc*nt;
+    const int64_t i0 = n * params->ith / params->nth;
+    const int64_t i1 = n * (params->ith + 1) / params->nth;
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t h    = i % hc;
+        const int64_t col  = i / hc;
+        const bool    post = col >= nt;
+        const int64_t t    = post ? col - nt : col;
+        const int64_t r    = post ? hc + h : h;
+        const volatile float t0 = mx[r + nrow*t] * sc[post ? 1 : 0];
+        const float t1 = t0 + bs[r];
+        const float s  = 1.0f / (1.0f + expf(-t1));
+        y[i] = post ? s * 2.0f : s + eps;
+    }
+}

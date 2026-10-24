@@ -3,7 +3,11 @@
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+#    if 0 /* local: CCCL 3.2's DeviceTopK::MaxPairs fails with "invalid configuration argument" once ncols grows
+             past ~1024.  The engine's DSA indexer calls ggml_top_k over the whole candidate set, so ncols tracks
+             the context and every prompt longer than ~1K tokens crashed (reproduced on the pre-fused binary).
+             Select the argsort fallback below instead: it handles any ncols (bitonic <= 1024, CUB argsort above)
+             and returns the same set; the engine canonicalises the order itself. */
 #        define CUB_TOP_K_AVAILABLE
 #        include <cuda/iterator>
 using namespace cub;
@@ -62,6 +66,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    ncols = src0->ne[0];
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
+    if (ncols > 1024) {
+        static int npr = 0;
+        if (npr++ < 6) fprintf(stderr, "top_k: nrows=%lld ncols=%lld k=%lld\n",
+                               (long long) nrows, (long long) ncols, (long long) k);
+    }
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented

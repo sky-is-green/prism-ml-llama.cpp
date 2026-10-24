@@ -1123,6 +1123,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV41_FAKE_QUANT",
+    "DSV41_HC_MIXES",
 
     "UNARY",
 
@@ -1140,7 +1142,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1238,6 +1240,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv41_fake_quant(x)",
+    "dsv41_hc_mixes(mixes, scale, base)",
 
     "unary(x)",
 
@@ -1255,7 +1259,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5424,6 +5428,9 @@ struct ggml_tensor * ggml_argsort_top_k(
     GGML_ASSERT(a->ne[0] >= k);
 
     struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+    // Strata-DS4 (tools/v41/ggml/rank-argsort.patch): only the first k of each row are read (the view below) - a
+    // backend may select them instead of sorting the whole row (CUDA: k <= 32, ggml-cuda/argsort.cu)
+    ggml_set_op_params_i32(result, 1, k);
 
     result = ggml_view_4d(ctx, result,
                 k, result->ne[1], result->ne[2], result->ne[3],
@@ -6553,6 +6560,42 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
 }
 
 // ggml_dsv4_hc_pre
+
+struct ggml_tensor * ggml_dsv41_fake_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   mode) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(mode >= 0 && mode <= 2);
+    GGML_ASSERT(ggml_nelements(a) % (mode == 1 ? 16 : 32) == 0);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params_i32(result, 0, mode);
+    result->op     = GGML_OP_DSV41_FAKE_QUANT;
+    result->src[0] = a;
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv41_hc_mixes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32 && ggml_is_contiguous(mixes));
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 2);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32 && ggml_is_contiguous(base));
+    GGML_ASSERT(base->ne[0] % 2 == 0);
+    const int64_t hc = base->ne[0] / 2;
+    const int64_t nt = mixes->ne[1] * mixes->ne[2] * mixes->ne[3];
+    GGML_ASSERT(mixes->ne[0] >= 2*hc);   // a Block.hc_mixes mixes tensor also carries the hc*hc comb rows after them
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, 2*nt);
+    ggml_set_op_params_f32(result, 0, eps);
+    result->op     = GGML_OP_DSV41_HC_MIXES;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+    return result;
+}
 
 struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
