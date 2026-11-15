@@ -42,6 +42,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_DSPARK,           "dspark"           },
     { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
+    { LLM_ARCH_MTP_SIDECAR,      "mtp-sidecar"      },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
     { LLM_ARCH_PHIMOE,           "phimoe"           },
@@ -701,6 +702,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
     { LLM_TENSOR_FC,                                     "fc" },
     { LLM_TENSOR_D2T,                                    "d2t" },
+    { LLM_TENSOR_MTP_FC1,                                "mtp.fc1.weight" },
+    { LLM_TENSOR_MTP_FC2,                                "mtp.fc2.weight" },
+    { LLM_TENSOR_MTP_FC3,                                "mtp.fc3.weight" },
     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
@@ -1135,6 +1139,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     { LLM_TENSOR_FC,                       { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT }       },
     { LLM_TENSOR_D2T,                      { LLM_TENSOR_LAYER_OUTPUT, GGML_OP_GET_ROWS }      },
+    {LLM_TENSOR_MTP_FC1,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_FC2,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_FC3,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     // dspark
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DFLY_LAYER_FUSION,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},

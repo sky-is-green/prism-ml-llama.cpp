@@ -1382,6 +1382,27 @@ struct llama_model_eagle3 : public llama_model_base {
 };
 
 
+// The trained MTP head as a standalone draft model: the sidecar carries only
+// fc1/fc2 (+ optional norm); everything else (token embeddings, the output
+// projection, and the target's h rows) comes from the target context via
+// ctx_other.  Consumed by the draft-mtp speculative lane (n_mtp_layers = 1).
+struct llama_model_mtp_sidecar : public llama_model_base {
+    llama_model_mtp_sidecar(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    ggml_tensor * fc1 = nullptr;   // [2*hidden, width]
+    ggml_tensor * fc2 = nullptr;   // [hidden, width]
+    ggml_tensor * fc3 = nullptr;   // [hidden, width] (optional state head)
+    ggml_tensor * norm = nullptr;  // [hidden] (optional; identity when absent)
+};
+
 struct llama_model_dflash : public llama_model_base {
     llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

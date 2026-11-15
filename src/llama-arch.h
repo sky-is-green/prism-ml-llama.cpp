@@ -47,6 +47,7 @@ enum llm_arch {
     LLM_ARCH_QWEN35MOE,
     LLM_ARCH_DSPARK,
     LLM_ARCH_QWEN4EXP,
+    LLM_ARCH_MTP_SIDECAR,
     LLM_ARCH_PHI2,
     LLM_ARCH_PHI3,
     LLM_ARCH_PHIMOE,
@@ -709,6 +710,9 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
+    LLM_TENSOR_MTP_FC1,
+    LLM_TENSOR_MTP_FC2,
+    LLM_TENSOR_MTP_FC3,
     // dspark drafter tensors. The decoder blocks reuse the standard
     // LLM_TENSOR_ATTN_* / LLM_TENSOR_FFN_* / LLM_TENSOR_OUTPUT_NORM /
     // LLM_TENSOR_OUTPUT / LLM_TENSOR_TOKEN_EMBD names; these are the

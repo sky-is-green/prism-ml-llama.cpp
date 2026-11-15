@@ -330,6 +330,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_MTP_SIDECAR:
+            return new llama_model_mtp_sidecar(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -2705,6 +2707,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
+        case LLM_ARCH_MTP_SIDECAR:
+            // stateless: the head consumes the target's h rows fed per batch,
+            // and every memory API null-guards
+            return nullptr;
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
@@ -3025,6 +3031,10 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
+}
+
+int32_t llama_model_n_embd_nextn(const llama_model * model) {
+    return model->hparams.n_embd_nextn();
 }
 
 int32_t llama_model_n_layer(const llama_model * model) {

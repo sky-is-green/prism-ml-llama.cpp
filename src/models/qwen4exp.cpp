@@ -26,6 +26,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
     GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+    // the NextN lane consumes the head input (the hc mixer's output row), not
+    // the flat hc state this arch's n_embd_out reports
+    hparams.n_embd_nextn_impl = hparams.n_embd;
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
@@ -341,8 +344,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids &&
+                !(cparams.embeddings_nextn && !cparams.embeddings_nextn_masked)) {
             // everything below is per token, so drop the rows that produce no output
+            // (with the NextN lane's unmasked h rows the tail runs on all rows: the
+            // mixer's output row IS the h the lane consumes for every position)
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
@@ -376,6 +382,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // the mixer's output row IS the head input: the NextN/MTP lane consumes it
+    // (its width is n_embd, not the hc state's n_embd_out - see n_embd_nextn)
+    if (cparams.embeddings_nextn) {
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+    }
 
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);

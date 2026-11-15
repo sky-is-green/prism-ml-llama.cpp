@@ -226,6 +226,11 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    // dimension of the h rows the NextN/MTP lane consumes (0 = use n_embd_out);
+    // the qwen4exp head input (the final hc mixer's 2560-wide row) differs from
+    // its n_embd_out (the 10240-wide hc state)
+    uint32_t n_embd_nextn_impl = 0;
+
     uint32_t dflash_block_size       = 0;
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
@@ -427,6 +432,9 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
+
+    // dimension of the hidden rows the NextN/MTP lane consumes
+    uint32_t n_embd_nextn() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;
