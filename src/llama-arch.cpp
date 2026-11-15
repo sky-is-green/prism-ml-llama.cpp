@@ -1277,10 +1277,15 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 }
 
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+    // note: QWEN4EXP is deliberately absent. Its hybrid GDN memory shares the
+    // qwen35 machinery, but partial rollback via the recurrent snapshots
+    // corrupts the state after a rejected speculative round (the next logits
+    // diverge from the non-speculative run). The checkpoint path (FULL) is
+    // exact; re-add it only after the snapshot restore is validated on this
+    // arch.
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_QWEN4EXP:   // same GDN hybrid state as qwen35; the recurrent memory is shared
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:

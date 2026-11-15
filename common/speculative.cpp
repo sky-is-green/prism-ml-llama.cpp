@@ -2369,6 +2369,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        if (const char * hd = getenv("SCION_H_DUMP")) {
+            // debug: dump (token, pos, target h row) for seq 0, batch order
+            llama_synchronize(ctx_tgt);
+            FILE * f = fopen(hd, "ab");
+            if (f) {
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    if (batch_in.seq_id[i][0] != 0) {
+                        continue;
+                    }
+                    const llama_token tok = batch_in.token[i];
+                    const llama_pos   pos = batch_in.pos[i];
+                    fwrite(&tok, sizeof(tok), 1, f);
+                    fwrite(&pos, sizeof(pos), 1, f);
+                    fwrite(verify_h[0].data() + (size_t) (i - i_batch_beg[0]) * n_embd,
+                           sizeof(float), n_embd, f);
+                }
+                fclose(f);
+            }
+        }
+
         return true;
     }
 
@@ -2454,6 +2474,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
+
+                if (getenv("SCION_SPEC_DEBUG") && i < 2) {
+                    double hn = 0.0;
+                    for (int q = 0; q < n_embd; ++q) hn += (double) pending_h[seq_id][q] * pending_h[seq_id][q];
+                    const auto & ddp = dparams[seq_id];
+                    fprintf(stderr, "SPECDBG step=%d seq=%d n_past=%d id_last=%d hnorm=%.1f draft=%d p=%.3f cands=%zu piece=%s\n",
+                            i, (int) seq_id, ddp.n_past, ddp.id_last, sqrt(hn), id, cur_p->data[0].p,
+                            cur_p->size,
+                            common_token_to_piece(ctx_dft, id).c_str());
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
