@@ -17,6 +17,9 @@ void llama_model_mtp_sidecar::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.f_norm_rms_eps <= 0.0f) {
         hparams.f_norm_rms_eps = 1e-6f;
     }
+    // the sidecar's head IS the one MTP layer (the MTP context gate wants
+    // n_layer_nextn > 0; the trunk block_count=1 is a dummy)
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     // everything else (n_embd, n_vocab, n_ctx_train, the dummy block count)
     // comes from the generic GGUF metadata; no trunk tensors are loaded
 }
@@ -30,19 +33,20 @@ void llama_model_mtp_sidecar::load_arch_tensors(llama_model_loader & ml) {
         throw std::runtime_error("mtp-sidecar requires mtp.fc1.weight [2*hidden, width]");
     }
     fc1 = create_tensor(tn(LLM_TENSOR_MTP_FC1, "weight"), { f1->ne[0], f1->ne[1] }, 0);
-    fc2 = create_tensor(tn(LLM_TENSOR_MTP_FC2, "weight"), { n_embd, fc1->ne[1] }, 0);
+    // gguf-py reverses dims on write: fc2's GGUF ne = [width, hidden]
+    fc2 = create_tensor(tn(LLM_TENSOR_MTP_FC2, "weight"), { fc1->ne[1], n_embd }, 0);
     if (fc2 == nullptr) {
-        throw std::runtime_error("mtp-sidecar requires mtp.fc2.weight [hidden, width]");
+        throw std::runtime_error("mtp-sidecar requires mtp.fc2.weight [width, hidden]");
     }
-    if (f1->ne[0] != 2 * n_embd || fc2->ne[1] != fc1->ne[1]) {
+    if (f1->ne[0] != 2 * n_embd || fc2->ne[0] != fc1->ne[1] || fc2->ne[1] != n_embd) {
         throw std::runtime_error(format("mtp-sidecar shape mismatch: fc1 [%lld, %lld], fc2 [%lld, %lld], n_embd %lld",
                 (long long) f1->ne[0], (long long) f1->ne[1], (long long) fc2->ne[0], (long long) fc2->ne[1],
                 (long long) n_embd));
     }
     // the state head is optional (v1 sidecars are logits-only: usable for one
     // draft per round, or with a teacher-forced chain)
-    fc3 = create_tensor(tn(LLM_TENSOR_MTP_FC3, "weight"), { n_embd, fc1->ne[1] }, TENSOR_NOT_REQUIRED);
-    if (fc3 && fc3->ne[1] != fc1->ne[1]) {
+    fc3 = create_tensor(tn(LLM_TENSOR_MTP_FC3, "weight"), { fc1->ne[1], n_embd }, TENSOR_NOT_REQUIRED);
+    if (fc3 && fc3->ne[0] != fc1->ne[1]) {
         throw std::runtime_error("mtp-sidecar state-head width mismatch");
     }
 
@@ -55,6 +59,7 @@ std::unique_ptr<llm_graph_context> llama_model_mtp_sidecar::build_arch_graph(con
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
+        case LLM_GRAPH_TYPE_DECODER_MTP:   // the draft-mtp lane's context
             return std::make_unique<graph>(*this, params);
         default:
             GGML_ABORT("invalid graph type for the mtp sidecar");
@@ -67,30 +72,38 @@ llama_model_mtp_sidecar::graph::graph(const llama_model & model, const llm_graph
 
     // both inputs matter and both are always present in the draft-mtp lane's
     // batches, so build them like the DFlash decoder does (build_inp_embd
-    // selects one branch only)
-    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+    // selects one branch only).  Keep the raw pointers: add_input takes the
+    // unique_ptr.
+    ggml_tensor * inp_tokens = nullptr;
+    ggml_tensor * h = nullptr;
+    {
+        auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-    ggml_set_input(inp->tokens);
-    res->t_inp_tokens = inp->tokens;
+        inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(inp_tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
-    ggml_set_input(inp->embd);
+        h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
+        ggml_set_input(h);
 
-    res->add_input(std::move(inp));
-
-    ggml_tensor * h = inp->embd;   // the target's head-input rows, n_embd wide
-    GGML_ASSERT(ubatch.embd != nullptr && "the mtp-sidecar consumes embd rows (the draft-mtp lane's batches)");
+        inp->tokens = inp_tokens;
+        inp->embd = h;
+        res->t_inp_tokens = inp_tokens;
+        res->add_input(std::move(inp));
+    }
 
     // the candidate token's embedding: the target's own token_embd (shared via ctx_other)
-    auto * tok_embd = m->tok_embd;
-    if (tok_embd == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-        GGML_ASSERT(model_other->tok_embd != nullptr && "the mtp-sidecar requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+    ggml_tensor * e = nullptr;
+    {
+        auto * tok_embd = m->tok_embd;
+        if (tok_embd == nullptr) {
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            GGML_ASSERT(model_other != nullptr && cparams.ctx_other != nullptr &&
+                    "the mtp-sidecar requires the target context (ctx_other)");
+            tok_embd = model_other->tok_embd;
+            GGML_ASSERT(tok_embd != nullptr && "the mtp-sidecar requires the target model's token embeddings");
+        }
+        e = ggml_get_rows(ctx0, tok_embd, inp_tokens);
     }
-    ggml_tensor * e = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
     ggml_tensor * out_ids = build_inp_out_ids();
 
