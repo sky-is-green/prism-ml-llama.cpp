@@ -245,6 +245,12 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
+    // an input tensor that the graph did not use has no buffer allocated (see
+    // the matching FIXME in llama_context::process_ubatch) - nothing to fill
+    if (out_ids->buffer == nullptr) {
+        return;
+    }
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
@@ -2563,6 +2569,13 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+    // a ubatch with no output rows (e.g. a mid-prompt chunk of a long prompt)
+    // needs no selection.  a zero-length input tensor is never allocated, so
+    // set_input() would touch a null buffer - skip the input entirely.
+    if (n_outputs == 0) {
+        return nullptr;
+    }
+
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism

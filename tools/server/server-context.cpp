@@ -1218,10 +1218,9 @@ private:
 
         slots.clear();
 
-        // Scion: Qwen4Exp's hybrid KV (GDN) aborts in this probe's tensor
-        // read-back (ggml_backend_tensor_get_async); short-context serving
-        // never removes sequences, so report "not supported" directly.
-        ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        // probe the memory's sequence-removal support (this decodes a tiny
+        // batch, so it must run after the NextN lane is enabled or not at all)
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }

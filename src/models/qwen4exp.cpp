@@ -380,15 +380,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
     // the mixer's output row IS the head input: the NextN/MTP lane consumes it
     // (its width is n_embd, not the hc state's n_embd_out - see n_embd_nextn)
     if (cparams.embeddings_nextn) {
         cb(cur, "h_nextn", -1);
         res->t_h_nextn = cur;
     }
+
+    // the unmasked NextN lane keeps every row through the mixer (that is the h
+    // the MTP lane consumes for each position), so the non-output rows are
+    // dropped here on the logits path only - same layout as qwen35.  this also
+    // keeps inp_out_ids in the graph so the scheduler allocates it (a skipped
+    // input tensor stays buffer-less and set_input() would abort).
+    if (inp_out_ids && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
