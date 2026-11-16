@@ -188,6 +188,13 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    // qwen4exp's GDN kernels also snapshot the state from BEFORE the ubatch, so
+    // its window covers a rollback of the whole verify batch (n_draft + 1),
+    // not just n_draft.  One extra plane makes the checkpoint path unnecessary
+    // for the draft-mtp lane.
+    if (cparams.n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN4EXP) {
+        cparams.n_rs_seq += 1;
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;

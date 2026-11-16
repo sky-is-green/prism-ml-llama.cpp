@@ -69,6 +69,21 @@ gated_delta_net_cuda(const float * q,
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     float         s_shard[cols_per_warp][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+    // keep_rs: slot n_tokens is the pre-batch state, so a rollback of the whole
+    // ubatch (all drafts rejected) is a snapshot restore too
+    if constexpr (keep_rs_t) {
+        if (n_tokens < K) {
+            float * pre = state + (int64_t) n_tokens * state_slot_stride;
+#pragma unroll
+            for (int c = 0; c < cols_per_warp; ++c) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    pre[(col + c) * S_v + i] = s_shard[c][r];
+                }
+            }
+        }
+    }
 
     ggml_cuda_pdl_sync();
 #pragma unroll

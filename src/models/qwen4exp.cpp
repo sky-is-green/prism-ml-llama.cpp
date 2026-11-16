@@ -1122,6 +1122,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
+    // recurrent rollback: the ssm state gets per-token snapshots in
+    // build_recurrent_attn; the conv state is a shift register and needs the
+    // same.  Slot s holds the state s tokens back (slot 0 = after the last
+    // token, already written above), so a rollback of r tokens can read
+    // plane r through s_copy() instead of replaying from a checkpoint.
+    if (cparams.n_rs_seq > 0) {
+        const int64_t K         = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_cur     = conv_input->ne[0] - state_cols; // tokens in this ubatch
+        const int64_t n_written = std::min<int64_t>(n_cur, K);
+        const int64_t mem_size  = (int64_t) mctx_cur->get_size();
+
+        for (int64_t s = 1; s <= n_written; ++s) {
+            if (s == n_written && n_cur >= K) {
+                continue;   // no slot for the pre-batch state in this batch
+            }
+            // s < n_cur: state after token (n_cur-1-s); s == n_cur: pre-batch state
+            const size_t col = s < n_cur ? (size_t) (n_cur - s) : 0;
+            ggml_tensor * snap = ggml_view_3d(ctx0, conv_input, state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    col * conv_input->nb[0]);
+            ggml_tensor * dst_s = ggml_view_2d(ctx0, conv_states_all,
+                    state_cols * channels, n_seqs,
+                    conv_states_all->nb[1],
+                    (size_t) (s * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, snap), dst_s));
+        }
+    }
+
     return conv_input;
 }
 
